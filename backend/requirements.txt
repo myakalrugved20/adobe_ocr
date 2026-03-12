@@ -1,6 +1,7 @@
 fastapi
 uvicorn[standard]
 python-multipart
+pdfservices-sdk
 PyMuPDF
 Pillow
 python-docx
