@@ -26,6 +26,14 @@ from backend.config import RENDER_ZOOM, BASE_DIR
 # ── ADOBE API ─────────────────────────────────────────────────────────────
 
 def _load_credentials():
+    client_id = os.environ.get("ADOBE_CLIENT_ID")
+    client_secret = os.environ.get("ADOBE_CLIENT_SECRET")
+    if client_id and client_secret:
+        return ServicePrincipalCredentials(
+            client_id=client_id,
+            client_secret=client_secret,
+        )
+    # Fallback to JSON file for local development
     creds_path = os.path.join(BASE_DIR, "pdfservices-api-credentials.json")
     with open(creds_path) as f:
         creds = json.load(f)
