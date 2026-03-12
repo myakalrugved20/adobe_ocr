@@ -1,0 +1,576 @@
+"""
+PDF → Word Converter (Flow Layout)
+====================================
+Approach matching professional conversion tools:
+  - Individual images (extracted + cropped regions), NOT full-page backgrounds
+  - Normal text flow with spacing/indentation where possible
+  - VML textboxes only for text overlaying images or multi-column areas
+  - Proper sections with margins
+"""
+
+import os
+import html as html_mod
+import fitz  # PyMuPDF
+from PIL import Image
+from lxml import etree
+
+from docx import Document
+from docx.shared import Pt, Emu, Cm, RGBColor
+from docx.oxml.ns import qn
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+# ── CONFIG ──────────────────────────────────────────────────────────────────
+PDF_PATH = "invesco-india-flexi-cap-fund0673fb07eee8616aaa28ff00007d74af (1).pdf"
+OUTPUT_DOCX = "output_rugved2.docx"
+WORK_DIR = "extracted_content/assets"
+RENDER_ZOOM = 4.0  # 288 DPI for cropping
+
+PT_TO_EMU = 12700  # 1 PDF point = 12700 EMU
+
+
+# ── HELPERS ─────────────────────────────────────────────────────────────────
+
+def map_font(font_name):
+    fn = font_name.lower()
+    if 'editor' in fn:
+        return 'Arial Black'
+    if 'graphikcompact' in fn:
+        return 'Arial Narrow'
+    return 'Arial'
+
+
+def color_hex(color_int):
+    return f'{color_int:06X}'
+
+
+def pt_emu(pt):
+    return int(pt * PT_TO_EMU)
+
+
+def crop_region(page_img_path, name, bbox_pt, zoom=RENDER_ZOOM):
+    """Crop a region from rendered page image. bbox in PDF points (top-left origin)."""
+    img = Image.open(page_img_path)
+    x0, y0, x1, y1 = [int(v * zoom) for v in bbox_pt]
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(img.width, x1), min(img.height, y1)
+    cropped = img.crop((x0, y0, x1, y1))
+    out = os.path.join(WORK_DIR, f'{name}.png')
+    cropped.save(out)
+    return out
+
+
+# ── PHASE 1: EXTRACT ALL ASSETS ────────────────────────────────────────────
+
+def extract_assets(pdf_path):
+    """Extract embedded images and render pages for region cropping."""
+    os.makedirs(WORK_DIR, exist_ok=True)
+    doc = fitz.open(pdf_path)
+    assets = {}
+
+    # Extract embedded raster images (convert all to PNG for python-docx compatibility)
+    for pg_num in range(len(doc)):
+        page = doc[pg_num]
+        for img_info in page.get_image_info(xrefs=True):
+            xref = img_info['xref']
+            if xref == 0:
+                continue
+            try:
+                img_data = doc.extract_image(xref)
+                ext = img_data['ext']
+                raw_path = os.path.join(WORK_DIR, f'img_p{pg_num}_x{xref}.{ext}')
+                with open(raw_path, 'wb') as f:
+                    f.write(img_data['image'])
+                # Convert to PNG for compatibility
+                png_path = os.path.join(WORK_DIR, f'img_p{pg_num}_x{xref}.png')
+                Image.open(raw_path).save(png_path, 'PNG')
+                assets[f'p{pg_num}_img_{xref}'] = {
+                    'path': png_path, 'bbox': img_info['bbox'],
+                    'size': (img_data['width'], img_data['height'])
+                }
+            except Exception as e:
+                print(f"  [!] Failed to extract xref={xref}: {e}")
+
+    # Render pages with text stripped for cropping vector graphics
+    for pg_num in range(len(doc)):
+        page = doc[pg_num]
+        text_dict = page.get_text('dict')
+        for block in text_dict['blocks']:
+            if block['type'] == 0:
+                for line in block['lines']:
+                    for span in line['spans']:
+                        page.add_redact_annot(fitz.Rect(span['bbox']), fill=False)
+        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+        pix = page.get_pixmap(matrix=fitz.Matrix(RENDER_ZOOM, RENDER_ZOOM), alpha=False)
+        path = os.path.join(WORK_DIR, f'page_{pg_num}_notext.png')
+        pix.save(path)
+        assets[f'p{pg_num}_render'] = path
+
+    # Also render pages at full quality (WITH text) for pixel-perfect photo cropping
+    doc2 = fitz.open(pdf_path)
+    for pg_num in range(len(doc2)):
+        page = doc2[pg_num]
+        pix = page.get_pixmap(matrix=fitz.Matrix(RENDER_ZOOM, RENDER_ZOOM), alpha=False)
+        path = os.path.join(WORK_DIR, f'page_{pg_num}_full.png')
+        pix.save(path)
+        assets[f'p{pg_num}_full'] = path
+    doc2.close()
+
+    doc.close()
+
+    # Crop specific graphic regions
+    p0 = assets['p0_render']      # text-stripped (for icons, shapes)
+    p0f = assets['p0_full']       # full quality (for photo area)
+    p1 = assets['p1_render']
+
+    assets['logo'] = crop_region(p0, 'logo', (20, 30, 260, 60))
+    # Photo area: crop from FULL render (with text) for pixel-perfect background
+    assets['photo_area'] = crop_region(p0f, 'photo_area', (0, 240, 596, 660))
+    assets['gray_bar_bg'] = crop_region(p0, 'gray_bar_bg', (28, 692, 567, 790))
+    assets['riskometer_left'] = crop_region(p0, 'riskometer_left', (200, 695, 345, 788))
+    assets['riskometer_right'] = crop_region(p0, 'riskometer_right', (420, 695, 565, 788))
+    assets['cyan_overlay'] = crop_region(p0, 'cyan_overlay', (28, 520, 260, 630))
+    assets['cyan_banner'] = crop_region(p1, 'cyan_banner', (0, 20, 567, 260))
+    assets['icon_flexibility'] = crop_region(p1, 'icon_flexibility', (250, 425, 292, 470))
+    assets['icon_dynamic'] = crop_region(p1, 'icon_dynamic', (250, 493, 292, 540))
+    assets['icon_longterm'] = crop_region(p1, 'icon_longterm', (250, 551, 292, 598))
+    assets['icon_diversification'] = crop_region(p1, 'icon_diversification', (250, 613, 292, 660))
+    assets['bottom_illustration'] = crop_region(p1, 'bottom_illustration', (20, 510, 245, 816))
+    assets['arrow_down'] = crop_region(p1, 'arrow_down', (380, 610, 420, 660))
+    assets['flexi_banner'] = crop_region(p1, 'flexi_cap_banner', (250, 660, 567, 695))
+    assets['blue_line'] = crop_region(p1, 'blue_underline', (28, 294, 225, 300))
+
+    print(f"  [+] Extracted {len(assets)} assets")
+    return assets
+
+
+# ── PHASE 2: EXTRACT TEXT ───────────────────────────────────────────────────
+
+def extract_text(pdf_path):
+    """Extract text blocks with lines and spans from PyMuPDF."""
+    doc = fitz.open(pdf_path)
+    pages_text = []
+
+    for pg_num in range(len(doc)):
+        page = doc[pg_num]
+        text_dict = page.get_text('dict')
+        blocks = []
+
+        for block in text_dict['blocks']:
+            if block['type'] != 0:
+                continue
+            lines = []
+            for line in block['lines']:
+                spans = []
+                for span in line['spans']:
+                    if not span['text'].strip():
+                        continue
+                    flags = span['flags']
+                    fn = span['font'].lower()
+                    is_bold = bool(flags & (1 << 4)) or 'bold' in fn or 'semibold' in fn or 'medium' in fn
+                    is_italic = bool(flags & (1 << 1))
+                    spans.append({
+                        'text': span['text'],
+                        'font': map_font(span['font']),
+                        'size': span['size'],
+                        'color': color_hex(span['color']),
+                        'bold': is_bold,
+                        'italic': is_italic,
+                        'bbox': span['bbox'],
+                    })
+                if spans:
+                    lines.append({
+                        'spans': spans,
+                        'bbox': line['bbox'],
+                    })
+            if lines:
+                blocks.append({
+                    'lines': lines,
+                    'bbox': block['bbox'],
+                })
+
+        pages_text.append({
+            'page': pg_num,
+            'width': page.rect.width,
+            'height': page.rect.height,
+            'blocks': blocks,
+        })
+
+    doc.close()
+    return pages_text
+
+
+# ── PHASE 3: WORD DOCUMENT BUILDER ─────────────────────────────────────────
+
+def add_floating_image(paragraph, image_path, left_emu, top_emu, width_emu, height_emu,
+                        behind=False, rel_from_v='page', rel_from_h='page'):
+    """Add a floating image anchored at absolute position."""
+    run = paragraph.add_run()
+    run.add_picture(image_path, width=width_emu, height=height_emu)
+
+    drawing = run._element.findall(qn('w:drawing'))[0]
+    inline = drawing.find(qn('wp:inline'))
+    graphic = inline.find(qn('a:graphic'))
+    extent = inline.find(qn('wp:extent'))
+    docPr = inline.find(qn('wp:docPr'))
+    cx, cy = extent.get('cx'), extent.get('cy')
+
+    z_index = '0' if behind else '251660288'
+    anchor = etree.SubElement(drawing, qn('wp:anchor'), {
+        'distT': '0', 'distB': '0', 'distL': '0', 'distR': '0',
+        'simplePos': '0', 'relativeHeight': z_index,
+        'behindDoc': '1' if behind else '0',
+        'locked': '0', 'layoutInCell': '1', 'allowOverlap': '1',
+    })
+    etree.SubElement(anchor, qn('wp:simplePos'), {'x': '0', 'y': '0'})
+    posH = etree.SubElement(anchor, qn('wp:positionH'), {'relativeFrom': rel_from_h})
+    etree.SubElement(posH, qn('wp:posOffset')).text = str(left_emu)
+    posV = etree.SubElement(anchor, qn('wp:positionV'), {'relativeFrom': rel_from_v})
+    etree.SubElement(posV, qn('wp:posOffset')).text = str(top_emu)
+    etree.SubElement(anchor, qn('wp:extent'), {'cx': cx, 'cy': cy})
+    etree.SubElement(anchor, qn('wp:effectExtent'), {'l': '0', 't': '0', 'r': '0', 'b': '0'})
+    etree.SubElement(anchor, qn('wp:wrapNone'))
+    anchor.append(docPr)
+    etree.SubElement(anchor, qn('wp:cNvGraphicFramePr'))
+    anchor.append(graphic)
+    drawing.remove(inline)
+
+
+def make_run_xml(span):
+    """Build <w:r> XML for a single span."""
+    escaped = html_mod.escape(span['text'])
+    sz = str(int(span['size'] * 2))
+    bold = '<w:b/>' if span['bold'] else ''
+    italic = '<w:i/>' if span['italic'] else ''
+    return f'''<w:r>
+      <w:rPr>
+        <w:rFonts w:ascii="{span['font']}" w:hAnsi="{span['font']}" w:cs="{span['font']}"/>
+        <w:sz w:val="{sz}"/><w:szCs w:val="{sz}"/>
+        {bold}{italic}
+        <w:color w:val="{span['color']}"/>
+      </w:rPr>
+      <w:t xml:space="preserve">{escaped}</w:t>
+    </w:r>'''
+
+
+def add_vml_textbox(doc, lines, left_pt, top_pt, width_pt, height_pt):
+    """Add a VML textbox containing multiple lines, each with colored runs."""
+    paragraphs_xml = ''
+    for line in lines:
+        runs_xml = ''.join(make_run_xml(s) for s in line['spans'])
+        paragraphs_xml += f'''<w:p>
+          <w:pPr><w:spacing w:after="0" w:before="0" w:line="240" w:lineRule="auto"/></w:pPr>
+          {runs_xml}
+        </w:p>'''
+
+    vml = f'''<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+         xmlns:v="urn:schemas-microsoft-com:vml"
+         xmlns:w10="urn:schemas-microsoft-com:office:word">
+      <w:pict>
+        <v:shape style="position:absolute;left:{left_pt:.2f}pt;top:{top_pt:.2f}pt;width:{width_pt:.2f}pt;height:{height_pt:.2f}pt;z-index:251660288;mso-position-horizontal-relative:page;mso-position-vertical-relative:page" filled="f" stroked="f">
+          <v:textbox inset="0,0,0,0">
+            <w:txbxContent>
+              {paragraphs_xml}
+            </w:txbxContent>
+          </v:textbox>
+          <w10:wrap type="none"/>
+        </v:shape>
+      </w:pict>
+    </w:r>'''
+
+    p = doc.add_paragraph()
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.space_after = Pt(0)
+    p._element.append(etree.fromstring(vml))
+
+
+def add_flow_paragraph(doc, lines, left_indent_pt=0, space_before_pt=0, alignment=None):
+    """Add a normal-flow paragraph with multiple runs preserving per-span colors."""
+    p = doc.add_paragraph()
+    p.paragraph_format.space_before = Pt(space_before_pt)
+    p.paragraph_format.space_after = Pt(0)
+    if left_indent_pt > 0:
+        p.paragraph_format.left_indent = Pt(left_indent_pt)
+    if alignment is not None:
+        p.alignment = alignment
+
+    for line_idx, line in enumerate(lines):
+        for span in line['spans']:
+            run = p.add_run(span['text'])
+            run.font.size = Pt(span['size'])
+            run.font.name = span['font']
+            run.bold = span['bold']
+            run.italic = span['italic']
+            if span['color'] != '000000':
+                run.font.color.rgb = RGBColor.from_string(span['color'])
+            # Set font for complex script too
+            rPr = run._element.get_or_add_rPr()
+            rFonts = rPr.find(qn('w:rFonts'))
+            if rFonts is None:
+                rFonts = etree.SubElement(rPr, qn('w:rFonts'))
+            rFonts.set(qn('w:cs'), span['font'])
+
+        # Add line break between lines (except last)
+        if line_idx < len(lines) - 1:
+            run = p.add_run()
+            br = etree.SubElement(run._element, qn('w:br'))
+
+    return p
+
+
+def set_section(section, width_pt, height_pt, left=0, right=0, top=0, bottom=0):
+    section.page_width = pt_emu(width_pt)
+    section.page_height = pt_emu(height_pt)
+    section.left_margin = pt_emu(left)
+    section.right_margin = pt_emu(right)
+    section.top_margin = pt_emu(top)
+    section.bottom_margin = pt_emu(bottom)
+    section.header_distance = 0
+    section.footer_distance = 0
+
+
+# ── PAGE BUILDERS ───────────────────────────────────────────────────────────
+
+def build_page_0(doc, page_text, assets):
+    """Build page 1 of the Invesco brochure."""
+    section = doc.sections[0]
+    page_w, page_h = page_text['width'], page_text['height']
+    set_section(section, page_w, page_h, left=28, right=28, top=30, bottom=14)
+    blocks = page_text['blocks']
+
+    # ── IMAGES (floating, placed at absolute positions) ──
+
+    # Use first paragraph as anchor for all floating images
+    anchor_p = doc.add_paragraph()
+    anchor_p.paragraph_format.space_before = Pt(0)
+    anchor_p.paragraph_format.space_after = Pt(0)
+
+    # Invesco logo (top-left)
+    add_floating_image(anchor_p, assets['logo'],
+                       pt_emu(20), pt_emu(30), pt_emu(240), pt_emu(30), behind=False)
+
+    # Main family photo area (cropped from full-quality page render)
+    add_floating_image(anchor_p, assets['photo_area'],
+                       pt_emu(0), pt_emu(240), pt_emu(596), pt_emu(420), behind=True)
+
+    # QR code
+    qr_info = assets.get('p0_img_122', {})
+    if qr_info:
+        add_floating_image(anchor_p, qr_info['path'],
+                           pt_emu(480), pt_emu(155), pt_emu(78), pt_emu(78), behind=False)
+
+    # Cyan overlay behind fund name
+    add_floating_image(anchor_p, assets['cyan_overlay'],
+                       pt_emu(28), pt_emu(520), pt_emu(232), pt_emu(110), behind=True)
+
+    # Gray bar background
+    add_floating_image(anchor_p, assets['gray_bar_bg'],
+                       pt_emu(28), pt_emu(692), pt_emu(539), pt_emu(98), behind=True)
+
+    # Risk-o-meters
+    add_floating_image(anchor_p, assets['riskometer_left'],
+                       pt_emu(200), pt_emu(695), pt_emu(145), pt_emu(93), behind=False)
+    add_floating_image(anchor_p, assets['riskometer_right'],
+                       pt_emu(420), pt_emu(695), pt_emu(145), pt_emu(93), behind=False)
+
+    # ── TEXT ──
+
+    # Block 0: Title "Market twists, turns, ups, downs."
+    b = blocks[0]
+    space = b['bbox'][1] - 30  # distance from top margin
+    add_flow_paragraph(doc, b['lines'], left_indent_pt=0, space_before_pt=space)
+
+    # Block 1: Subtitle "Meet them all with a smile."
+    b = blocks[1]
+    gap = b['bbox'][1] - blocks[0]['bbox'][3]
+    add_flow_paragraph(doc, b['lines'], left_indent_pt=0, space_before_pt=gap)
+
+    # "Scan QR code to view fund page" (right side - needs textbox)
+    b = blocks[23]  # "Scan QR code" block
+    add_vml_textbox(doc, b['lines'],
+                    left_pt=b['bbox'][0], top_pt=b['bbox'][1],
+                    width_pt=b['bbox'][2] - b['bbox'][0] + 5,
+                    height_pt=(b['bbox'][3] - b['bbox'][1]) * 1.2)
+
+    # "Invesco India Flexi Cap Fund" overlay on photo (textbox)
+    b = blocks[5]  # "Invesco India" + "Flexi Cap Fund"
+    b2 = blocks[6]  # "(An open ended...)"
+    combined_lines = b['lines'] + b2['lines']
+    add_vml_textbox(doc, combined_lines,
+                    left_pt=b['bbox'][0], top_pt=b['bbox'][1],
+                    width_pt=max(b['bbox'][2], b2['bbox'][2]) - b['bbox'][0] + 5,
+                    height_pt=b2['bbox'][3] - b['bbox'][1] + 5)
+
+    # Bottom text blocks (disclaimers, risk info) - use textboxes for positioned content
+    # "This product is suitable..." block
+    for b_idx in [2, 3]:
+        b = blocks[b_idx]
+        add_vml_textbox(doc, b['lines'],
+                        left_pt=b['bbox'][0], top_pt=b['bbox'][1],
+                        width_pt=b['bbox'][2] - b['bbox'][0] + 5,
+                        height_pt=(b['bbox'][3] - b['bbox'][1]) * 1.15)
+
+    # "As per AMFI..." block
+    b = blocks[4]
+    add_vml_textbox(doc, b['lines'],
+                    left_pt=b['bbox'][0], top_pt=b['bbox'][1],
+                    width_pt=b['bbox'][2] - b['bbox'][0] + 5,
+                    height_pt=(b['bbox'][3] - b['bbox'][1]) * 1.15)
+
+    # "Scheme Risk-o-meter" label
+    b = blocks[7]
+    add_vml_textbox(doc, b['lines'],
+                    left_pt=b['bbox'][0], top_pt=b['bbox'][1],
+                    width_pt=b['bbox'][2] - b['bbox'][0] + 5,
+                    height_pt=(b['bbox'][3] - b['bbox'][1]) * 1.3)
+
+    # Risk-o-meter text labels (blocks 8-22)
+    for b_idx in range(8, min(23, len(blocks))):
+        b = blocks[b_idx]
+        add_vml_textbox(doc, b['lines'],
+                        left_pt=b['bbox'][0], top_pt=b['bbox'][1],
+                        width_pt=b['bbox'][2] - b['bbox'][0] + 3,
+                        height_pt=(b['bbox'][3] - b['bbox'][1]) * 1.3)
+
+    print("  [+] Page 0 built")
+
+
+def build_page_1(doc, page_text, assets):
+    """Build page 2 of the Invesco brochure."""
+    section = doc.add_section()
+    page_w, page_h = page_text['width'], page_text['height']
+    set_section(section, page_w, page_h, left=28, right=28, top=20, bottom=14)
+    blocks = page_text['blocks']
+
+    # ── IMAGES ──
+    anchor_p = doc.add_paragraph()
+    anchor_p.paragraph_format.space_before = Pt(0)
+    anchor_p.paragraph_format.space_after = Pt(0)
+
+    # Cyan banner with family illustration
+    add_floating_image(anchor_p, assets['cyan_banner'],
+                       pt_emu(0), pt_emu(20), pt_emu(567), pt_emu(240), behind=True)
+
+    # Blue underline under "Presenting"
+    add_floating_image(anchor_p, assets['blue_line'],
+                       pt_emu(28), pt_emu(294), pt_emu(197), pt_emu(3), behind=False)
+
+    # Benefit icons
+    add_floating_image(anchor_p, assets['icon_flexibility'],
+                       pt_emu(252), pt_emu(428), pt_emu(36), pt_emu(38), behind=False)
+    add_floating_image(anchor_p, assets['icon_dynamic'],
+                       pt_emu(252), pt_emu(496), pt_emu(36), pt_emu(40), behind=False)
+    add_floating_image(anchor_p, assets['icon_longterm'],
+                       pt_emu(252), pt_emu(554), pt_emu(36), pt_emu(40), behind=False)
+    add_floating_image(anchor_p, assets['icon_diversification'],
+                       pt_emu(252), pt_emu(616), pt_emu(36), pt_emu(40), behind=False)
+
+    # Bottom illustration
+    add_floating_image(anchor_p, assets['bottom_illustration'],
+                       pt_emu(20), pt_emu(510), pt_emu(225), pt_emu(306), behind=False)
+
+    # Arrow down
+    add_floating_image(anchor_p, assets['arrow_down'],
+                       pt_emu(385), pt_emu(612), pt_emu(35), pt_emu(42), behind=False)
+
+    # Flexi Cap banner
+    add_floating_image(anchor_p, assets['flexi_banner'],
+                       pt_emu(252), pt_emu(662), pt_emu(315), pt_emu(30), behind=True)
+
+    # ── TEXT ──
+
+    # Block 0: "Equity markets are often unpredictable..." (in cyan banner)
+    b = blocks[0]
+    add_vml_textbox(doc, b['lines'],
+                    left_pt=b['bbox'][0], top_pt=b['bbox'][1],
+                    width_pt=b['bbox'][2] - b['bbox'][0] + 5,
+                    height_pt=(b['bbox'][3] - b['bbox'][1]) * 1.15)
+
+    # Block 1: "What you need is a fund that offers Expertise and Flexibility..."
+    b = blocks[1]
+    add_vml_textbox(doc, b['lines'],
+                    left_pt=b['bbox'][0], top_pt=b['bbox'][1],
+                    width_pt=b['bbox'][2] - b['bbox'][0] + 5,
+                    height_pt=(b['bbox'][3] - b['bbox'][1]) * 1.15)
+
+    # Block 2: "Presenting / Invesco India Flexi Cap Fund / a fund that responds..."
+    # Left column - textbox
+    b = blocks[2]
+    add_vml_textbox(doc, b['lines'],
+                    left_pt=b['bbox'][0], top_pt=b['bbox'][1],
+                    width_pt=b['bbox'][2] - b['bbox'][0] + 5,
+                    height_pt=(b['bbox'][3] - b['bbox'][1]) * 1.1)
+
+    # Block 3: "A fund which aims to identify winners..."
+    b = blocks[3]
+    add_vml_textbox(doc, b['lines'],
+                    left_pt=b['bbox'][0], top_pt=b['bbox'][1],
+                    width_pt=b['bbox'][2] - b['bbox'][0] + 5,
+                    height_pt=(b['bbox'][3] - b['bbox'][1]) * 1.15)
+
+    # Right column: "Benefits of investing in Flexicap Funds"
+    b = blocks[13]  # header
+    add_vml_textbox(doc, b['lines'],
+                    left_pt=b['bbox'][0], top_pt=b['bbox'][1],
+                    width_pt=b['bbox'][2] - b['bbox'][0] + 5,
+                    height_pt=(b['bbox'][3] - b['bbox'][1]) * 1.3)
+
+    # Block 4: "There are times when a mandated investment approach..."
+    b = blocks[4]
+    add_vml_textbox(doc, b['lines'],
+                    left_pt=b['bbox'][0], top_pt=b['bbox'][1],
+                    width_pt=b['bbox'][2] - b['bbox'][0] + 5,
+                    height_pt=(b['bbox'][3] - b['bbox'][1]) * 1.15)
+
+    # Benefit sections (title + description pairs)
+    benefit_blocks = [
+        (5, 6),   # Flexibility
+        (7, 8),   # Dynamic
+        (9, 10),  # Long term ownership
+        (11, 12), # Diversification
+    ]
+    for title_idx, desc_idx in benefit_blocks:
+        if title_idx < len(blocks) and desc_idx < len(blocks):
+            bt = blocks[title_idx]
+            bd = blocks[desc_idx]
+            # Title
+            add_vml_textbox(doc, bt['lines'],
+                            left_pt=bt['bbox'][0], top_pt=bt['bbox'][1],
+                            width_pt=bt['bbox'][2] - bt['bbox'][0] + 5,
+                            height_pt=(bt['bbox'][3] - bt['bbox'][1]) * 1.3)
+            # Description
+            add_vml_textbox(doc, bd['lines'],
+                            left_pt=bd['bbox'][0], top_pt=bd['bbox'][1],
+                            width_pt=bd['bbox'][2] - bd['bbox'][0] + 5,
+                            height_pt=(bd['bbox'][3] - bd['bbox'][1]) * 1.15)
+
+    # "Flexi Cap approach helps balance risk & returns"
+    b = blocks[14]
+    add_vml_textbox(doc, b['lines'],
+                    left_pt=b['bbox'][0], top_pt=b['bbox'][1],
+                    width_pt=b['bbox'][2] - b['bbox'][0] + 5,
+                    height_pt=(b['bbox'][3] - b['bbox'][1]) * 1.3)
+
+    print("  [+] Page 1 built")
+
+
+# ── MAIN ────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print("=" * 60)
+    print("PDF -> Word Converter (Flow Layout)")
+    print("=" * 60)
+
+    print("\n[Phase 1] Extracting assets...")
+    assets = extract_assets(PDF_PATH)
+
+    print("\n[Phase 2] Extracting text...")
+    pages_text = extract_text(PDF_PATH)
+    for pt in pages_text:
+        print(f"  [+] Page {pt['page']}: {len(pt['blocks'])} text blocks")
+
+    print("\n[Phase 3] Building Word document...")
+    doc = Document()
+    build_page_0(doc, pages_text[0], assets)
+    build_page_1(doc, pages_text[1], assets)
+    doc.save(OUTPUT_DOCX)
+    print(f"\n  [OK] Saved: {OUTPUT_DOCX}")
+    print("\nDone!")

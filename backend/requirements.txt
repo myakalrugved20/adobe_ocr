@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+python-multipart
+PyMuPDF
+Pillow
+python-docx
+lxml
+deep-translator
