@@ -7,7 +7,11 @@ from backend.routers import upload, project, translate, download
 
 app = FastAPI(title="PDF to Word Translator")
 
-allowed_origins = ["http://localhost:5173", "http://localhost:3000"]
+allowed_origins = [
+    "http://localhost:5173", "http://localhost:5174",
+    "http://localhost:5175", "http://localhost:5176",
+    "http://localhost:3000",
+]
 frontend_url = os.environ.get("FRONTEND_URL")
 if frontend_url:
     allowed_origins.append(frontend_url)
