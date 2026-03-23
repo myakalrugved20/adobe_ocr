@@ -1,7 +1,7 @@
 import axios from 'axios';
 import type { Project } from '../types/project';
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000';
 const API = axios.create({ baseURL: API_BASE, timeout: 300000 });
 
 export async function uploadPdf(file: File): Promise<Project> {
