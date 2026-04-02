@@ -9,6 +9,14 @@ class TranslateRequest(BaseModel):
     paragraph_mode: bool = False
 
 
+class TranslateGroupRequest(BaseModel):
+    project_id: str
+    page_index: int
+    block_ids: list[str]
+    target_lang: str
+    source_lang: str = "auto"
+
+
 class SaveLayoutRequest(BaseModel):
     project_id: str
     pages: list  # full pages array with updated blocks

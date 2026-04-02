@@ -96,6 +96,7 @@ def _build_run_element(span, parent):
     r_fonts.set(qn('w:ascii'), font)
     r_fonts.set(qn('w:hAnsi'), font)
     r_fonts.set(qn('w:cs'), font)
+    r_fonts.set(qn('w:eastAsia'), font)
 
     sz_val = str(int(span['size'] * 2))
     etree.SubElement(rPr, qn('w:sz')).set(qn('w:val'), sz_val)
@@ -130,12 +131,16 @@ def make_vml_textbox_run(lines, left_pt, top_pt, width_pt, height_pt):
         f'width:{width_pt:.2f}pt;height:{height_pt:.2f}pt;'
         f'z-index:251660288;'
         f'mso-position-horizontal-relative:page;'
-        f'mso-position-vertical-relative:page'
+        f'mso-position-vertical-relative:page;'
+        f'mso-fit-shape-to-text:t'
     )
     shape = etree.SubElement(pict, _vqn('v:shape'), {
         'style': style, 'filled': 'f', 'stroked': 'f',
     })
-    textbox = etree.SubElement(shape, _vqn('v:textbox'), {'inset': '0,0,0,0'})
+    textbox = etree.SubElement(shape, _vqn('v:textbox'), {
+        'inset': '0,0,0,0',
+        'style': 'mso-fit-shape-to-text:t',
+    })
     txbx = etree.SubElement(textbox, _vqn('w:txbxContent'))
 
     for line in lines:
@@ -157,8 +162,8 @@ def add_positioned_table(anchor_p, table_data, page_height_pt):
     """Build a native Word table with absolute positioning, inserted after anchor_p.
 
     Uses tblpPr (table positioning properties) to place the table at the
-    exact coordinates from the PDF. Inserts directly into the body XML
-    after the anchor paragraph to keep it within the correct section.
+    exact coordinates from the PDF. Handles col_span via gridSpan and uses
+    actual cell bbox widths for accurate column sizing.
     """
     bbox = table_data['bbox']
     rows = table_data['rows']
@@ -168,16 +173,45 @@ def add_positioned_table(anchor_p, table_data, page_height_pt):
     left_pt = bbox[0]
     top_pt = bbox[1]
     table_width_pt = bbox[2] - bbox[0]
+    num_cols = table_data.get('num_cols', 0)
 
-    max_cols = max(len(row['cells']) for row in rows)
-    if max_cols == 0:
+    if num_cols == 0:
         return
 
-    num_rows = len(rows)
+    # Determine grid column widths from cell bboxes.
+    # Collect all column edge x-coordinates, then cluster nearby edges.
+    raw_edges = set()
+    raw_edges.add(round(bbox[0], 1))
+    raw_edges.add(round(bbox[2], 1))
+    for row in rows:
+        for cell in row['cells']:
+            cb = cell.get('bbox', [])
+            if cb and len(cb) >= 4 and cb[2] > cb[0]:
+                raw_edges.add(round(cb[0], 1))
+                raw_edges.add(round(cb[2], 1))
+    raw_edges = sorted(raw_edges)
 
-    # Build table XML directly (avoid doc.add_table which appends to body end)
+    # Cluster edges within tolerance to avoid micro-columns
+    EDGE_TOL = 3.0
+    col_edges = []
+    for e in raw_edges:
+        if col_edges and abs(e - col_edges[-1]) < EDGE_TOL:
+            col_edges[-1] = (col_edges[-1] + e) / 2
+        else:
+            col_edges.append(e)
+
+    # Build grid columns from consecutive edges
+    grid_widths_twips = []
+    for j in range(len(col_edges) - 1):
+        w = col_edges[j + 1] - col_edges[j]
+        grid_widths_twips.append(int(w * 20))
+    n_grid_cols = len(grid_widths_twips)
+
+    if n_grid_cols == 0:
+        return
+
+    # Build table XML directly
     tbl_el = etree.SubElement(anchor_p._element.getparent(), qn('w:tbl'))
-    # Move it right after anchor_p
     anchor_p._element.addnext(tbl_el)
 
     # Table properties
@@ -212,38 +246,85 @@ def add_positioned_table(anchor_p, table_data, page_height_pt):
         border_el.set(qn('w:space'), '0')
         border_el.set(qn('w:color'), '999999')
 
-    # Table grid (column definitions)
+    # Table grid
     tbl_grid = etree.SubElement(tbl_el, qn('w:tblGrid'))
-    col_width_twips = int(table_width_pt * 20 / max_cols)
-    for _ in range(max_cols):
+    for gw in grid_widths_twips:
         grid_col = etree.SubElement(tbl_grid, qn('w:gridCol'))
-        grid_col.set(qn('w:w'), str(col_width_twips))
+        grid_col.set(qn('w:w'), str(gw))
+
+    # Helper: find which grid column index a cell's left edge maps to
+    def _grid_col_for_x(x_pt):
+        x_r = round(x_pt, 1)
+        best = 0
+        best_dist = abs(col_edges[0] - x_r)
+        for k, edge in enumerate(col_edges):
+            d = abs(edge - x_r)
+            if d < best_dist:
+                best_dist = d
+                best = k
+        return best
 
     # Build rows and cells
     for ri, row in enumerate(rows):
         tr_el = etree.SubElement(tbl_el, qn('w:tr'))
-        for ci in range(max_cols):
-            tc_el = etree.SubElement(tr_el, qn('w:tc'))
 
-            # Cell properties
+        # Set fixed row height from cell bboxes to prevent table growth
+        row_h_pt = 0
+        for cell in row['cells']:
+            cb = cell.get('bbox', [])
+            if cb and len(cb) >= 4 and cb[3] > cb[1]:
+                row_h_pt = max(row_h_pt, cb[3] - cb[1])
+        if row_h_pt > 0:
+            tr_pr = etree.SubElement(tr_el, qn('w:trPr'))
+            tr_height = etree.SubElement(tr_pr, qn('w:trHeight'))
+            tr_height.set(qn('w:val'), str(int(row_h_pt * 20)))
+            tr_height.set(qn('w:hRule'), 'exact')
+
+        grid_col_idx = 0  # track which grid column we're at
+
+        for cell in row['cells']:
+            cell_bbox = cell.get('bbox', [])
+            col_span = cell.get('col_span', 1)
+
+            # Calculate how many grid columns this cell spans from its bbox
+            if cell_bbox and len(cell_bbox) >= 4 and cell_bbox[2] > cell_bbox[0]:
+                start_gc = _grid_col_for_x(cell_bbox[0])
+                end_gc = _grid_col_for_x(cell_bbox[2])
+                actual_span = max(1, end_gc - start_gc)
+
+                # Fill empty grid cells before this cell if there's a gap
+                while grid_col_idx < start_gc and grid_col_idx < n_grid_cols:
+                    empty_tc = etree.SubElement(tr_el, qn('w:tc'))
+                    empty_pr = etree.SubElement(empty_tc, qn('w:tcPr'))
+                    empty_w = etree.SubElement(empty_pr, qn('w:tcW'))
+                    empty_w.set(qn('w:w'), str(grid_widths_twips[grid_col_idx]))
+                    empty_w.set(qn('w:type'), 'dxa')
+                    etree.SubElement(empty_tc, qn('w:p'))
+                    grid_col_idx += 1
+
+                cw = sum(grid_widths_twips[start_gc:end_gc]) if end_gc <= n_grid_cols else int((cell_bbox[2] - cell_bbox[0]) * 20)
+            else:
+                actual_span = col_span
+                cw = sum(grid_widths_twips[grid_col_idx:grid_col_idx + actual_span]) if grid_col_idx + actual_span <= n_grid_cols else int(table_width_pt * 20 // n_grid_cols)
+
+            tc_el = etree.SubElement(tr_el, qn('w:tc'))
             tc_pr = etree.SubElement(tc_el, qn('w:tcPr'))
 
             # Cell width
-            cell = row['cells'][ci] if ci < len(row['cells']) else {'text': '', 'bbox': [], 'is_header': False}
-            cell_bbox = cell.get('bbox', [])
-            if cell_bbox and len(cell_bbox) >= 4 and cell_bbox[2] > cell_bbox[0]:
-                cw = int((cell_bbox[2] - cell_bbox[0]) * 20)
-            else:
-                cw = col_width_twips
             tc_w = etree.SubElement(tc_pr, qn('w:tcW'))
             tc_w.set(qn('w:w'), str(cw))
             tc_w.set(qn('w:type'), 'dxa')
 
-            # Cell margins
+            # Grid span for merged cells
+            if actual_span > 1:
+                grid_span = etree.SubElement(tc_pr, qn('w:gridSpan'))
+                grid_span.set(qn('w:val'), str(actual_span))
+
+            # Cell margins (minimal to match PDF layout)
             tc_mar = etree.SubElement(tc_pr, qn('w:tcMar'))
             for side in ['top', 'left', 'bottom', 'right']:
                 mar = etree.SubElement(tc_mar, qn(f'w:{side}'))
-                mar.set(qn('w:w'), '20')
+                mar.set(qn('w:w'), '0')
                 mar.set(qn('w:type'), 'dxa')
 
             # Header shading
@@ -274,11 +355,24 @@ def add_positioned_table(anchor_p, table_data, page_height_pt):
                 r_fonts.set(qn('w:ascii'), 'Arial')
                 r_fonts.set(qn('w:hAnsi'), 'Arial')
                 r_fonts.set(qn('w:cs'), 'Arial')
+                r_fonts.set(qn('w:eastAsia'), 'Arial')
                 if cell.get('is_header'):
                     etree.SubElement(r_pr, qn('w:b'))
                 t_el = etree.SubElement(r_el, qn('w:t'))
                 t_el.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-                t_el.text = text
+                t_el.text = _safe(text)
+
+            grid_col_idx += actual_span
+
+        # Fill remaining grid columns in the row
+        while grid_col_idx < n_grid_cols:
+            empty_tc = etree.SubElement(tr_el, qn('w:tc'))
+            empty_pr = etree.SubElement(empty_tc, qn('w:tcPr'))
+            empty_w = etree.SubElement(empty_pr, qn('w:tcW'))
+            empty_w.set(qn('w:w'), str(grid_widths_twips[grid_col_idx]))
+            empty_w.set(qn('w:type'), 'dxa')
+            etree.SubElement(empty_tc, qn('w:p'))
+            grid_col_idx += 1
 
 
 def build_docx(project_data, project_dir, output_path):
@@ -329,11 +423,38 @@ def build_docx(project_data, project_dir, output_path):
                 behind=False
             )
 
-        # Place tables as native Word tables with absolute positioning
+        # Render table cell text as VML textboxes (same as regular text).
+        # The background image already contains the table borders/headers,
+        # so we just need text at the exact cell positions.
         page_tables = page.get('tables', [])
         table_bboxes = [t['bbox'] for t in page_tables]
         for table in page_tables:
-            add_positioned_table(anchor_p, table, page['height'])
+            for row in table.get('rows', []):
+                for cell in row.get('cells', []):
+                    text = cell.get('text', '').strip()
+                    if not text:
+                        continue
+                    cb = cell.get('bbox', [0, 0, 0, 0])
+                    if cb[2] <= cb[0]:
+                        continue
+                    cw = cb[2] - cb[0]
+                    ch = cb[3] - cb[1]
+                    font_size = min(7, max(4, ch * 0.7))
+                    is_header = cell.get('is_header', False)
+                    cell_lines = [{'spans': [{
+                        'text': text,
+                        'font': 'Arial',
+                        'size': round(font_size, 1),
+                        'color': '000000',
+                        'bold': is_header,
+                        'italic': False,
+                    }]}]
+                    vml_run = make_vml_textbox_run(
+                        cell_lines,
+                        left_pt=cb[0], top_pt=cb[1],
+                        width_pt=cw + 2, height_pt=ch,
+                    )
+                    anchor_p._element.append(vml_run)
 
         # Place text blocks as VML textboxes packed into the anchor paragraph
         # (packing into one paragraph prevents overflow onto extra pages)
@@ -341,11 +462,24 @@ def build_docx(project_data, project_dir, output_path):
             bbox = block['bbox']
             if table_bboxes and _is_inside_table(bbox, table_bboxes):
                 continue
+            raw_w = bbox[2] - bbox[0]
+            raw_h = bbox[3] - bbox[1]
+            # Estimate required width from text content and font size
+            max_line_width = 0
+            for line in block.get('lines', []):
+                line_w = 0
+                for span in line.get('spans', []):
+                    # Approximate: each char needs ~0.6 * font_size points
+                    char_w = span.get('size', 11) * 0.6
+                    line_w += len(span.get('text', '')) * char_w
+                max_line_width = max(max_line_width, line_w)
+            # Use the wider of: original bbox width or estimated text width (+ padding)
+            width_pt = max(raw_w + 5, max_line_width + 10)
             vml_run = make_vml_textbox_run(
                 block['lines'],
                 left_pt=bbox[0], top_pt=bbox[1],
-                width_pt=(bbox[2] - bbox[0]) + 5,
-                height_pt=(bbox[3] - bbox[1]) * 1.2
+                width_pt=width_pt,
+                height_pt=raw_h * 1.2
             )
             anchor_p._element.append(vml_run)
 

@@ -5,6 +5,7 @@ export interface Span {
   color: string;
   bold: boolean;
   italic: boolean;
+  underline?: boolean;
   bbox: number[];
 }
 
@@ -17,6 +18,8 @@ export interface Block {
   id: string;
   bbox: number[];
   lines: Line[];
+  opacity?: number;
+  align?: 'left' | 'center' | 'right' | 'justify';
 }
 
 export interface ImageData {

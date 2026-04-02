@@ -35,6 +35,23 @@ export async function translateProject(
   return data;
 }
 
+export async function translateBlockGroup(
+  projectId: string,
+  pageIndex: number,
+  blockIds: string[],
+  targetLang: string,
+  sourceLang = 'auto'
+): Promise<Project> {
+  const { data } = await API.post('/api/translate-group', {
+    project_id: projectId,
+    page_index: pageIndex,
+    block_ids: blockIds,
+    target_lang: targetLang,
+    source_lang: sourceLang,
+  });
+  return data;
+}
+
 export function getDownloadUrl(projectId: string): string {
   return `${API_BASE}/api/download/${projectId}`;
 }

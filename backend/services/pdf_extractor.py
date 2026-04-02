@@ -9,6 +9,7 @@ import os
 import io
 import json
 import zipfile
+import unicodedata
 import fitz  # PyMuPDF
 
 from adobe.pdfservices.operation.auth.service_principal_credentials import ServicePrincipalCredentials
@@ -114,6 +115,48 @@ def map_font(font_name):
     return 'Arial'
 
 
+# Known PUA-to-Unicode mappings for symbols in PDFs with custom/embedded fonts.
+# Extend this dict as new misencoded characters are discovered.
+_PUA_FIXUP = {
+    '\uF020': ' ',
+    '\uF025': '%',
+    '\uF02C': ',',
+    '\uF02D': '-',
+    '\uF02E': '.',
+    '\uF02F': '/',
+    '\uF030': '0', '\uF031': '1', '\uF032': '2', '\uF033': '3', '\uF034': '4',
+    '\uF035': '5', '\uF036': '6', '\uF037': '7', '\uF038': '8', '\uF039': '9',
+    '\uF0A8': '₹',
+    '\uF0B9': '₹',
+    '\uF0B7': '•',
+    '\uF0B0': '°',
+    '\uF06C': '●',
+    '\uF0D8': '▲',
+    '\uF0E8': '►',
+}
+
+
+_RUPEE_FONT_FIXUP = {
+    '`': '₹',   # Backtick glyph in RupeeForadian/Rupee fonts is the ₹ symbol
+    '~': '₹',
+}
+
+
+def _normalize_text(text, font_name=''):
+    """Fix PUA codepoints from embedded fonts and normalize Unicode."""
+    if not text:
+        return text
+    fn = font_name.lower()
+    # Fonts like "RupeeForadian" or "Rupee" use ASCII glyphs for ₹
+    use_rupee = 'rupee' in fn
+    result = []
+    for ch in text:
+        if use_rupee:
+            ch = _RUPEE_FONT_FIXUP.get(ch, ch)
+        result.append(_PUA_FIXUP.get(ch, ch))
+    return unicodedata.normalize('NFC', ''.join(result))
+
+
 def color_hex(color_int):
     return f'{color_int:06X}'
 
@@ -188,7 +231,7 @@ def _extract_text_formatting(pdf_path):
                     )
                     is_italic = bool(flags & (1 << 1))
                     spans.append({
-                        'text': span['text'],
+                        'text': _normalize_text(span['text']),
                         'font': map_font(span['font']),
                         'size': round(span['size'], 2),
                         'color': color_hex(span['color']),
@@ -217,9 +260,12 @@ def _extract_text_formatting(pdf_path):
 def _parse_adobe_tables(adobe_data, page_heights):
     """Parse Adobe structured data to extract table structures.
 
+    Splits multi-page tables into per-page segments so each page gets only
+    the rows that belong to it.
+
     Returns dict: page_index -> list of table dicts, each with:
       - bbox: [left, top, right, bottom] in top-left origin
-      - rows: list of row dicts, each with cells containing text and bbox
+      - rows: list of row dicts, each with cells containing text, bbox, and col_span
     """
     import re
     elements = adobe_data.get('elements', [])
@@ -238,37 +284,26 @@ def _parse_adobe_tables(adobe_data, page_heights):
 
     for table_el in top_tables:
         table_path = table_el['Path']
-        page = table_el.get('Page', 0)
-        page_h = page_heights.get(page, 841.92)
+        base_page = table_el.get('Page', 0)
         attrs = table_el.get('attributes', {})
-        num_rows = attrs.get('NumRow', 0)
         num_cols = attrs.get('NumCol', 0)
 
-        # Table bbox (convert from bottom-left to top-left)
-        bbox_bl = attrs.get('BBox', table_el.get('Bounds', []))
-        if not bbox_bl or len(bbox_bl) < 4:
-            continue
-        table_bbox = [
-            round(bbox_bl[0], 2),
-            round(page_h - bbox_bl[3], 2),
-            round(bbox_bl[2], 2),
-            round(page_h - bbox_bl[1], 2),
-        ]
-
-        # Collect cell elements belonging to this table
+        # Collect child elements belonging to this table
         child_prefix = table_path + '/'
         child_elements = [
             e for e in elements
             if e.get('Path', '').startswith(child_prefix)
         ]
 
-        # Parse rows and cells from the element paths
-        # Paths look like: .../TR[n]/TD[m]/P or .../TR[n]/TH[m]/P
-        rows_dict = {}  # row_idx -> {col_idx -> cell_data}
+        # Parse all cells, tracking which page each belongs to.
+        # Key: (page, row_idx) -> {col_idx -> cell_data}
+        page_rows_dict = {}
 
         for el in child_elements:
             path = el.get('Path', '')
             rel_path = path[len(table_path):]
+            el_page = el.get('Page', base_page)
+            page_h = page_heights.get(el_page, 841.92)
 
             # Extract row index from TR or TR[n]
             tr_match = re.match(r'/TR(?:\[(\d+)\])?/', rel_path)
@@ -282,16 +317,17 @@ def _parse_adobe_tables(adobe_data, page_heights):
                 continue
             col_idx = int(cell_match.group(1)) if cell_match.group(1) else 1
 
-            # Is this a text element (P, P/Sub, etc.)?
-            text = el.get('Text', '').strip()
+            key = (el_page, row_idx)
+
+            text = _normalize_text(el.get('Text', '').strip())
             if not text:
-                # Cell container (TD/TH) has bbox but no text
+                # Cell container (TD/TH) — has bbox but no text
                 cell_bbox_bl = el.get('attributes', {}).get('BBox', [])
                 if cell_bbox_bl and len(cell_bbox_bl) >= 4:
-                    if row_idx not in rows_dict:
-                        rows_dict[row_idx] = {}
-                    if col_idx not in rows_dict[row_idx]:
-                        rows_dict[row_idx][col_idx] = {
+                    if key not in page_rows_dict:
+                        page_rows_dict[key] = {}
+                    if col_idx not in page_rows_dict[key]:
+                        page_rows_dict[key][col_idx] = {
                             'text': '',
                             'bbox': [
                                 round(cell_bbox_bl[0], 2),
@@ -303,40 +339,144 @@ def _parse_adobe_tables(adobe_data, page_heights):
                         }
                 continue
 
-            if row_idx not in rows_dict:
-                rows_dict[row_idx] = {}
-            if col_idx not in rows_dict[row_idx]:
-                rows_dict[row_idx][col_idx] = {
+            if key not in page_rows_dict:
+                page_rows_dict[key] = {}
+            if col_idx not in page_rows_dict[key]:
+                page_rows_dict[key][col_idx] = {
                     'text': '',
                     'bbox': [0, 0, 0, 0],
                     'is_header': '/TH' in rel_path,
                 }
 
-            cell = rows_dict[row_idx][col_idx]
-            # Append text (multiple P elements in same cell)
+            cell = page_rows_dict[key][col_idx]
             if cell['text']:
                 cell['text'] += ' ' + text
             else:
                 cell['text'] = text
 
-        # Build ordered rows
-        rows = []
-        for ri in sorted(rows_dict.keys()):
-            cells = []
-            for ci in sorted(rows_dict[ri].keys()):
-                cells.append(rows_dict[ri][ci])
-            rows.append({'cells': cells})
+        # Group rows by page
+        pages_in_table = sorted(set(pg for pg, _ in page_rows_dict.keys()))
 
-        table_data = {
-            'bbox': table_bbox,
-            'rows': rows,
-            'num_rows': num_rows,
-            'num_cols': num_cols,
-        }
+        for pg in pages_in_table:
+            page_h = page_heights.get(pg, 841.92)
 
-        if page not in tables_by_page:
-            tables_by_page[page] = []
-        tables_by_page[page].append(table_data)
+            # Collect rows for this page
+            rows_dict = {}
+            for (p, ri), cols in page_rows_dict.items():
+                if p == pg:
+                    rows_dict[ri] = cols
+
+            if not rows_dict:
+                continue
+
+            max_col = num_cols
+            for ri in rows_dict:
+                for ci in rows_dict[ri]:
+                    if ci > max_col:
+                        max_col = ci
+
+            # Cluster column edges
+            raw_edges = []
+            for ri in sorted(rows_dict.keys()):
+                for ci in sorted(rows_dict[ri].keys()):
+                    cell = rows_dict[ri][ci]
+                    bbox = cell.get('bbox', [0, 0, 0, 0])
+                    if bbox[2] > bbox[0]:
+                        raw_edges.append(round(bbox[0], 1))
+                        raw_edges.append(round(bbox[2], 1))
+            raw_edges = sorted(set(raw_edges))
+
+            EDGE_TOL = 3.0
+            col_edges = []
+            for e in raw_edges:
+                if col_edges and abs(e - col_edges[-1]) < EDGE_TOL:
+                    col_edges[-1] = (col_edges[-1] + e) / 2
+                else:
+                    col_edges.append(e)
+
+            # Build rows with col_span
+            rows = []
+            for ri in sorted(rows_dict.keys()):
+                cells = []
+                for ci in sorted(rows_dict[ri].keys()):
+                    cell = dict(rows_dict[ri][ci])
+                    bbox = cell.get('bbox', [0, 0, 0, 0])
+                    if bbox[2] > bbox[0] and len(col_edges) > 1:
+                        cell_left = round(bbox[0], 1)
+                        cell_right = round(bbox[2], 1)
+                        spans = 0
+                        for j in range(len(col_edges) - 1):
+                            mid = (col_edges[j] + col_edges[j + 1]) / 2
+                            if cell_left - EDGE_TOL <= mid <= cell_right + EDGE_TOL:
+                                spans += 1
+                        cell['col_span'] = max(1, spans)
+                    else:
+                        cell['col_span'] = 1
+                    cells.append(cell)
+                rows.append({'cells': cells})
+
+            # Compute bbox from cells on this page only
+            all_min_x = all_min_y = 99999
+            all_max_x = all_max_y = 0
+            for row in rows:
+                for cell in row['cells']:
+                    cb = cell.get('bbox', [0, 0, 0, 0])
+                    if cb[2] > cb[0]:
+                        all_min_x = min(all_min_x, cb[0])
+                        all_min_y = min(all_min_y, cb[1])
+                        all_max_x = max(all_max_x, cb[2])
+                        all_max_y = max(all_max_y, cb[3])
+
+            if all_max_x <= all_min_x:
+                continue
+
+            table_bbox = [
+                round(all_min_x, 2), round(all_min_y, 2),
+                round(all_max_x, 2), round(all_max_y, 2),
+            ]
+
+            table_data = {
+                'bbox': table_bbox,
+                'rows': rows,
+                'num_rows': len(rows),
+                'num_cols': max_col,
+            }
+
+            if pg not in tables_by_page:
+                tables_by_page[pg] = []
+            tables_by_page[pg].append(table_data)
+
+    # Remove duplicate/overlapping tables on the same page.
+    # When a multi-page table continuation overlaps with a standalone table,
+    # keep the standalone (usually more accurate) and drop the overlap.
+    for pg in list(tables_by_page.keys()):
+        tables = tables_by_page[pg]
+        if len(tables) <= 1:
+            continue
+        # Sort by area (smaller first) — standalone tables are usually smaller
+        tables.sort(key=lambda t: (t['bbox'][2]-t['bbox'][0]) * (t['bbox'][3]-t['bbox'][1]))
+        kept = []
+        for t in tables:
+            tb = t['bbox']
+            # Check if this table's bbox is mostly covered by a kept table
+            overlaps = False
+            for k in kept:
+                kb = k['bbox']
+                # Check if t's center falls inside k
+                tcx = (tb[0] + tb[2]) / 2
+                tcy = (tb[1] + tb[3]) / 2
+                if kb[0] - 5 <= tcx <= kb[2] + 5 and kb[1] - 5 <= tcy <= kb[3] + 5:
+                    overlaps = True
+                    break
+                # Check if k's center falls inside t
+                kcx = (kb[0] + kb[2]) / 2
+                kcy = (kb[1] + kb[3]) / 2
+                if tb[0] - 5 <= kcx <= tb[2] + 5 and tb[1] - 5 <= kcy <= tb[3] + 5:
+                    overlaps = True
+                    break
+            if not overlaps:
+                kept.append(t)
+        tables_by_page[pg] = kept
 
     return tables_by_page
 

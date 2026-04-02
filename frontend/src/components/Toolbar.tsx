@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react';
 
 const LANGUAGES = [
+  { code: 'en', name: 'English' },
   { code: 'hi', name: 'Hindi' },
   { code: 'mr', name: 'Marathi' },
   { code: 'ta', name: 'Tamil' },
@@ -22,9 +23,17 @@ const LANGUAGES = [
 interface ToolbarProps {
   onUpload: (file: File) => void;
   onTranslate: (lang: string) => void;
+  onTranslateGroup: (lang: string) => void;
   onDownload: () => void;
+  onUndo: () => void;
+  onRedo: () => void;
+  canUndo: boolean;
+  canRedo: boolean;
   onToggleAddMode: () => void;
+  onToggleGroupMode: () => void;
   addMode: boolean;
+  groupMode: boolean;
+  groupCount: number;
   hasProject: boolean;
   loading: boolean;
   translating: boolean;
@@ -32,8 +41,10 @@ interface ToolbarProps {
 }
 
 export default function Toolbar({
-  onUpload, onTranslate, onDownload, onToggleAddMode,
-  addMode, hasProject, loading, translating, pdfFilename,
+  onUpload, onTranslate, onTranslateGroup, onDownload,
+  onUndo, onRedo, canUndo, canRedo,
+  onToggleAddMode, onToggleGroupMode,
+  addMode, groupMode, groupCount, hasProject, loading, translating, pdfFilename,
 }: ToolbarProps) {
   const fileRef = useRef<HTMLInputElement>(null);
   const [targetLang, setTargetLang] = useState('hi');
@@ -90,6 +101,54 @@ export default function Toolbar({
           >
             {addMode ? '+ Placing...' : '+ Text Box'}
           </button>
+
+          <div style={{ width: 1, height: 24, background: '#45475a' }} />
+
+          <button
+            onClick={onUndo}
+            disabled={!canUndo}
+            title="Undo (Ctrl+Z)"
+            style={{
+              ...btnStyle,
+              opacity: canUndo ? 1 : 0.4,
+              cursor: canUndo ? 'pointer' : 'default',
+              fontSize: 15,
+              padding: '4px 10px',
+            }}
+          >
+            &#x21A9;
+          </button>
+          <button
+            onClick={onRedo}
+            disabled={!canRedo}
+            title="Redo (Ctrl+Shift+Z)"
+            style={{
+              ...btnStyle,
+              opacity: canRedo ? 1 : 0.4,
+              cursor: canRedo ? 'pointer' : 'default',
+              fontSize: 15,
+              padding: '4px 10px',
+            }}
+          >
+            &#x21AA;
+          </button>
+
+          <div style={{ width: 1, height: 24, background: '#45475a' }} />
+
+          <button
+            onClick={onToggleGroupMode}
+            style={{
+              ...btnStyle,
+              background: groupMode ? '#cba6f7' : '#45475a',
+              color: groupMode ? '#1e1e2e' : '#cdd6f4',
+            }}
+          >
+            {groupMode
+              ? groupCount > 0
+                ? `Selected ${groupCount} blocks`
+                : 'Draw to select...'
+              : 'Group Translate'}
+          </button>
         </>
       )}
 
@@ -112,8 +171,18 @@ export default function Toolbar({
             disabled={translating}
             style={{ ...btnStyle, background: '#a6e3a1', color: '#1e1e2e' }}
           >
-            {translating ? 'Translating...' : 'Translate'}
+            {translating ? 'Translating...' : 'Translate All'}
           </button>
+
+          {groupCount > 0 && (
+            <button
+              onClick={() => onTranslateGroup(targetLang)}
+              disabled={translating}
+              style={{ ...btnStyle, background: '#cba6f7', color: '#1e1e2e' }}
+            >
+              {translating ? 'Translating...' : `Translate ${groupCount} Blocks`}
+            </button>
+          )}
 
           <button
             onClick={onDownload}

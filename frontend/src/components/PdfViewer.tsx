@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, memo } from 'react';
 import { Document, Page, pdfjs } from 'react-pdf';
 import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
@@ -14,7 +14,7 @@ interface PdfViewerProps {
   onTotalPages?: (n: number) => void;
 }
 
-export default function PdfViewer({ file, currentPage, onTotalPages }: PdfViewerProps) {
+export default memo(function PdfViewer({ file, currentPage, onTotalPages }: PdfViewerProps) {
   const [fileUrl, setFileUrl] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [dims, setDims] = useState({ w: 0, h: 0 });
@@ -95,4 +95,4 @@ export default function PdfViewer({ file, currentPage, onTotalPages }: PdfViewer
       )}
     </div>
   );
-}
+})
