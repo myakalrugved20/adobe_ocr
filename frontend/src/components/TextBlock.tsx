@@ -299,7 +299,7 @@ const TextBlock = forwardRef<TextBlockHandle, TextBlockProps>(function TextBlock
           zIndex: selected ? 100 : 10,
           boxSizing: 'border-box',
           padding: 0,
-          overflow: 'visible',
+          overflow: 'hidden',
           opacity,
         }}
       >
