@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo, memo } from 'react';
+import { useState, useEffect, useRef, useCallback, memo } from 'react';
 import { Document, Page, pdfjs } from 'react-pdf';
 import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
@@ -17,8 +17,11 @@ interface PdfViewerProps {
 export default memo(function PdfViewer({ file, currentPage, onTotalPages }: PdfViewerProps) {
   const [fileUrl, setFileUrl] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const [dims, setDims] = useState({ w: 0, h: 0 });
+  const [containerWidth, setContainerWidth] = useState(0);
+  const [containerHeight, setContainerHeight] = useState(0);
   const [pageAspect, setPageAspect] = useState<number | null>(null);
+  const onTotalPagesRef = useRef(onTotalPages);
+  onTotalPagesRef.current = onTotalPages;
 
   useEffect(() => {
     if (file) {
@@ -30,9 +33,6 @@ export default memo(function PdfViewer({ file, currentPage, onTotalPages }: PdfV
     }
   }, [file]);
 
-  // Stable file source to prevent Document re-mounting on unrelated re-renders
-  const fileSource = useMemo(() => fileUrl ? { url: fileUrl } : null, [fileUrl]);
-
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -40,7 +40,8 @@ export default memo(function PdfViewer({ file, currentPage, onTotalPages }: PdfV
     const update = () => {
       const w = el.clientWidth;
       const h = el.clientHeight;
-      setDims(prev => (prev.w === w && prev.h === h) ? prev : { w, h });
+      setContainerWidth(prev => prev === w ? prev : w);
+      setContainerHeight(prev => prev === h ? prev : h);
     };
     update();
     const obs = new ResizeObserver(() => {
@@ -55,22 +56,21 @@ export default memo(function PdfViewer({ file, currentPage, onTotalPages }: PdfV
     setPageAspect(page.width / page.height);
   }, []);
 
+  // Use a ref-based callback so Document never sees a new onLoadSuccess reference
   const onDocLoaded = useCallback(({ numPages: n }: { numPages: number }) => {
-    onTotalPages?.(n);
-  }, [onTotalPages]);
+    onTotalPagesRef.current?.(n);
+  }, []);
 
-  // Compute the width that makes the PDF fill the container as much as possible
-  let pageWidth = dims.w;
-  if (pageAspect && dims.w > 0 && dims.h > 0) {
-    const containerAspect = dims.w / dims.h;
+  // Compute the width that makes the PDF fill the container
+  let pageWidth = containerWidth;
+  if (pageAspect && containerWidth > 0 && containerHeight > 0) {
+    const containerAspect = containerWidth / containerHeight;
     if (containerAspect > pageAspect) {
-      pageWidth = dims.h * pageAspect;
-    } else {
-      pageWidth = dims.w;
+      pageWidth = containerHeight * pageAspect;
     }
   }
 
-  if (!fileSource) {
+  if (!fileUrl) {
     return (
       <div ref={containerRef} style={{
         display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -90,9 +90,9 @@ export default memo(function PdfViewer({ file, currentPage, onTotalPages }: PdfV
       alignItems: 'center',
       justifyContent: 'center',
     }}>
-      {dims.w > 0 && (
+      {containerWidth > 0 && (
         <Document
-          file={fileSource}
+          file={fileUrl}
           onLoadSuccess={onDocLoaded}
           loading={null}
         >
@@ -102,6 +102,7 @@ export default memo(function PdfViewer({ file, currentPage, onTotalPages }: PdfV
             renderTextLayer={false}
             renderAnnotationLayer={false}
             onLoadSuccess={onPageLoaded}
+            loading={null}
           />
         </Document>
       )}
