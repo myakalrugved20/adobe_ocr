@@ -6,4 +6,4 @@ PyMuPDF
 Pillow
 python-docx
 lxml
-deep-translator
+google-cloud-translate
