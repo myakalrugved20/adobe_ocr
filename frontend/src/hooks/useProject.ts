@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import type { Project, Block } from '../types/project';
 import * as api from '../api/client';
 
@@ -15,7 +15,7 @@ export function useProject() {
   // Undo/redo history
   const historyRef = useRef<string[]>([]);
   const historyIndexRef = useRef(-1);
-  const [historyVersion, setHistoryVersion] = useState(0); // triggers re-render for canUndo/canRedo
+  const [_historyVersion, setHistoryVersion] = useState(0); // triggers re-render for canUndo/canRedo
 
   const canUndo = historyIndexRef.current > 0;
   const canRedo = historyIndexRef.current < historyRef.current.length - 1;
