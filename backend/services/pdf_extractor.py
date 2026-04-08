@@ -561,15 +561,32 @@ def _parse_adobe_tables(adobe_data, page_heights):
 
 
 def _is_inside_table(block_bbox, table_bboxes, margin=2):
-    """Check if a text block falls inside any table region."""
+    """Check if a text block overlaps any table region.
+
+    Returns True if the block's center falls inside a table OR if more than
+    50% of the block's area overlaps with a table bbox. This catches blocks
+    that span cell boundaries or sit near table edges.
+    """
     bx0, by0, bx1, by1 = block_bbox
     cx = (bx0 + bx1) / 2
     cy = (by0 + by1) / 2
+    block_area = max((bx1 - bx0) * (by1 - by0), 1)
+
     for tbbox in table_bboxes:
         tx0, ty0, tx1, ty1 = tbbox
+        # Center-point check (original)
         if (tx0 - margin <= cx <= tx1 + margin and
                 ty0 - margin <= cy <= ty1 + margin):
             return True
+        # Overlap-area check: catch blocks near edges
+        ox0 = max(bx0, tx0 - margin)
+        oy0 = max(by0, ty0 - margin)
+        ox1 = min(bx1, tx1 + margin)
+        oy1 = min(by1, ty1 + margin)
+        if ox1 > ox0 and oy1 > oy0:
+            overlap = (ox1 - ox0) * (oy1 - oy0)
+            if overlap / block_area > 0.5:
+                return True
     return False
 
 
