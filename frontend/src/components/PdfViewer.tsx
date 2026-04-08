@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, memo } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo, memo } from 'react';
 import { Document, Page, pdfjs } from 'react-pdf';
 import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
@@ -25,40 +25,52 @@ export default memo(function PdfViewer({ file, currentPage, onTotalPages }: PdfV
       const url = URL.createObjectURL(file);
       setFileUrl(url);
       return () => URL.revokeObjectURL(url);
+    } else {
+      setFileUrl(null);
     }
   }, [file]);
+
+  // Stable file source to prevent Document re-mounting on unrelated re-renders
+  const fileSource = useMemo(() => fileUrl ? { url: fileUrl } : null, [fileUrl]);
 
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
+    let rafId: number;
     const update = () => {
-      setDims({ w: el.clientWidth, h: el.clientHeight });
+      const w = el.clientWidth;
+      const h = el.clientHeight;
+      setDims(prev => (prev.w === w && prev.h === h) ? prev : { w, h });
     };
     update();
-    const obs = new ResizeObserver(update);
+    const obs = new ResizeObserver(() => {
+      cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(update);
+    });
     obs.observe(el);
-    return () => obs.disconnect();
+    return () => { obs.disconnect(); cancelAnimationFrame(rafId); };
   }, []);
 
   const onPageLoaded = useCallback((page: { width: number; height: number }) => {
     setPageAspect(page.width / page.height);
   }, []);
 
+  const onDocLoaded = useCallback(({ numPages: n }: { numPages: number }) => {
+    onTotalPages?.(n);
+  }, [onTotalPages]);
+
   // Compute the width that makes the PDF fill the container as much as possible
-  // while maintaining aspect ratio
   let pageWidth = dims.w;
   if (pageAspect && dims.w > 0 && dims.h > 0) {
     const containerAspect = dims.w / dims.h;
     if (containerAspect > pageAspect) {
-      // Container is wider than page → height is the constraint
       pageWidth = dims.h * pageAspect;
     } else {
-      // Container is taller than page → width is the constraint
       pageWidth = dims.w;
     }
   }
 
-  if (!fileUrl) {
+  if (!fileSource) {
     return (
       <div ref={containerRef} style={{
         display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -80,13 +92,13 @@ export default memo(function PdfViewer({ file, currentPage, onTotalPages }: PdfV
     }}>
       {dims.w > 0 && (
         <Document
-          file={fileUrl}
-          onLoadSuccess={({ numPages: n }) => { onTotalPages?.(n); }}
+          file={fileSource}
+          onLoadSuccess={onDocLoaded}
           loading={null}
         >
           <Page
             pageNumber={currentPage + 1}
-            width={pageWidth}
+            width={Math.round(pageWidth)}
             renderTextLayer={false}
             renderAnnotationLayer={false}
             onLoadSuccess={onPageLoaded}

@@ -21,16 +21,29 @@ _project_id = None
 
 
 def _get_client():
-    """Lazily initialise the GCP Translation client and project ID."""
+    """Lazily initialise the GCP Translation client and project ID.
+
+    Credential sources (checked in order):
+      1. GOOGLE_CREDENTIALS_JSON env var (raw JSON string, used on HF Spaces)
+      2. GOOGLE_APPLICATION_CREDENTIALS env var (path to JSON file)
+      3. Local fallback file in project root
+    """
     global _client, _project_id
     if _client is not None:
         return _client, _project_id
 
-    creds_path = os.environ.get(
-        "GOOGLE_APPLICATION_CREDENTIALS",
-        os.path.join(BASE_DIR, "project-e3488f99-018c-4f8e-b7b-825b30068c6b.json"),
-    )
-    credentials = service_account.Credentials.from_service_account_file(creds_path)
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    if creds_json:
+        # Load credentials directly from JSON string (HF Spaces secret)
+        info = json.loads(creds_json)
+        credentials = service_account.Credentials.from_service_account_info(info)
+    else:
+        creds_path = os.environ.get(
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            os.path.join(BASE_DIR, "project-e3488f99-018c-4f8e-b7b-825b30068c6b.json"),
+        )
+        credentials = service_account.Credentials.from_service_account_file(creds_path)
+
     _project_id = credentials.project_id
     _client = translate.TranslationServiceClient(credentials=credentials)
     return _client, _project_id
