@@ -24,7 +24,7 @@ interface TextBlockProps {
 }
 
 const TextBlock = forwardRef<TextBlockHandle, TextBlockProps>(function TextBlock({
-  block, scale, selected, grouped, onSelect, onMove, onResize, onDelete, onTextChange, onTextChangeAll, onUpdateLines, onDrag, onDragEnd,
+  block, scale, selected, grouped, onSelect, onMove, onResize, onDelete, onTextChange: _onTextChange, onTextChangeAll, onUpdateLines, onDrag, onDragEnd,
 }, ref) {
   const [editing, setEditing] = useState(false);
   const [resizing, setResizing] = useState<string | null>(null);
@@ -54,7 +54,7 @@ const TextBlock = forwardRef<TextBlockHandle, TextBlockProps>(function TextBlock
     },
   }), [editing]);
 
-  const [x0, y0, x1, y1] = block.bbox;
+  const [x0, y0, x1, _y1] = block.bbox;
   const left = x0 * scale;
   const top = y0 * scale;
   const width = (x1 - x0) * scale;
@@ -231,7 +231,7 @@ const TextBlock = forwardRef<TextBlockHandle, TextBlockProps>(function TextBlock
       const tag = active.tagName;
       if (tag === 'INPUT' || tag === 'BUTTON' || tag === 'SELECT' || tag === 'TEXTAREA') return;
       // If focus moved to another contentEditable (not ours), exit
-      if (active.isContentEditable && active !== editRef.current) { exitEdit(); return; }
+      if ((active as HTMLElement).isContentEditable && active !== editRef.current) { exitEdit(); return; }
       // If focus is still in our contentEditable, stay
       if (editRef.current?.contains(active)) return;
       exitEdit();
