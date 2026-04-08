@@ -37,6 +37,46 @@ def _safe(text):
     return _INVALID_XML_RE.sub('', text)
 
 
+def _char_width_multiplier(text):
+    """Return a per-character width multiplier based on the script of the text.
+
+    Latin/ASCII chars are narrow (~0.6× font size), while Devanagari, CJK,
+    Arabic, and other complex scripts are wider (~0.85-1.0× font size).
+    """
+    if not text:
+        return 0.6
+    wide = 0
+    total = 0
+    for ch in text:
+        if ch.isspace():
+            continue
+        total += 1
+        cp = ord(ch)
+        # Devanagari (Hindi, Marathi, Sanskrit, etc.)
+        if 0x0900 <= cp <= 0x097F or 0xA8E0 <= cp <= 0xA8FF:
+            wide += 1
+        # CJK Unified Ideographs
+        elif 0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF:
+            wide += 1
+        # Arabic
+        elif 0x0600 <= cp <= 0x06FF or 0x0750 <= cp <= 0x077F:
+            wide += 1
+        # Bengali, Gujarati, Tamil, Telugu, Kannada, Malayalam, etc.
+        elif 0x0980 <= cp <= 0x0DFF:
+            wide += 1
+        # Thai
+        elif 0x0E00 <= cp <= 0x0E7F:
+            wide += 1
+        # Korean Hangul
+        elif 0xAC00 <= cp <= 0xD7AF:
+            wide += 1
+    if total == 0:
+        return 0.6
+    wide_ratio = wide / total
+    # Blend: mostly wide chars → 0.85, mostly Latin → 0.6
+    return 0.6 + wide_ratio * 0.25
+
+
 def pt_emu(pt):
     return int(pt * PT_TO_EMU)
 
@@ -116,8 +156,39 @@ def _build_run_element(span, parent):
     return r_el
 
 
-def make_vml_textbox_run(lines, left_pt, top_pt, width_pt, height_pt):
-    """Build a VML textbox <w:r> element for a single text block."""
+def _is_paragraph_block(lines):
+    """Check if a multi-line block should flow as a single paragraph.
+
+    Returns True when all lines share a similar dominant font size,
+    meaning they were merged from a continuous paragraph.
+    """
+    if len(lines) <= 1:
+        return False
+    sizes = []
+    for line in lines:
+        total_len = 0
+        size_weight = {}
+        for span in line.get('spans', []):
+            slen = len(span.get('text', ''))
+            total_len += slen
+            sz = span.get('size', 11)
+            size_weight[sz] = size_weight.get(sz, 0) + slen
+        if size_weight:
+            sizes.append(max(size_weight, key=size_weight.get))
+    if not sizes:
+        return False
+    base = sizes[0]
+    return all(abs(s - base) <= 0.5 for s in sizes)
+
+
+def make_vml_textbox_run(lines, left_pt, top_pt, width_pt, height_pt,
+                         flow_as_paragraph=False):
+    """Build a VML textbox <w:r> element for a single text block.
+
+    When flow_as_paragraph=True, all lines are merged into a single <w:p>
+    with spaces between them, so Word wraps the text naturally within the
+    fixed textbox width — matching browser CSS word-wrap behavior.
+    """
     W = NSMAP['w']
     V = NSMAP['v']
     W10 = NSMAP['w10']
@@ -143,7 +214,8 @@ def make_vml_textbox_run(lines, left_pt, top_pt, width_pt, height_pt):
     })
     txbx = etree.SubElement(textbox, _vqn('w:txbxContent'))
 
-    for line in lines:
+    if flow_as_paragraph and len(lines) > 1:
+        # Merge all lines into one <w:p> — Word wraps within textbox width
         p_el = etree.SubElement(txbx, _vqn('w:p'))
         pPr = etree.SubElement(p_el, _vqn('w:pPr'))
         spacing = etree.SubElement(pPr, _vqn('w:spacing'))
@@ -151,8 +223,33 @@ def make_vml_textbox_run(lines, left_pt, top_pt, width_pt, height_pt):
         spacing.set(_vqn('w:before'), '0')
         spacing.set(_vqn('w:line'), '240')
         spacing.set(_vqn('w:lineRule'), 'auto')
-        for span in line.get('spans', []):
-            _build_run_element(span, p_el)
+        for li, line in enumerate(lines):
+            # Add a space run between lines so words don't merge
+            if li > 0:
+                last_span = lines[li - 1].get('spans', [{}])[-1] if lines[li - 1].get('spans') else {}
+                space_span = {
+                    'text': ' ',
+                    'font': last_span.get('font', 'Arial'),
+                    'size': last_span.get('size', 11),
+                    'color': last_span.get('color', '000000'),
+                    'bold': last_span.get('bold', False),
+                    'italic': last_span.get('italic', False),
+                }
+                _build_run_element(space_span, p_el)
+            for span in line.get('spans', []):
+                _build_run_element(span, p_el)
+    else:
+        # One <w:p> per line (original behavior for labels/headings)
+        for line in lines:
+            p_el = etree.SubElement(txbx, _vqn('w:p'))
+            pPr = etree.SubElement(p_el, _vqn('w:pPr'))
+            spacing = etree.SubElement(pPr, _vqn('w:spacing'))
+            spacing.set(_vqn('w:after'), '0')
+            spacing.set(_vqn('w:before'), '0')
+            spacing.set(_vqn('w:line'), '240')
+            spacing.set(_vqn('w:lineRule'), 'auto')
+            for span in line.get('spans', []):
+                _build_run_element(span, p_el)
 
     etree.SubElement(shape, _vqn('w10:wrap'), {'type': 'none'})
     return r_root
@@ -464,22 +561,31 @@ def build_docx(project_data, project_dir, output_path):
                 continue
             raw_w = bbox[2] - bbox[0]
             raw_h = bbox[3] - bbox[1]
-            # Estimate required width from text content and font size
-            max_line_width = 0
-            for line in block.get('lines', []):
-                line_w = 0
-                for span in line.get('spans', []):
-                    # Approximate: each char needs ~0.6 * font_size points
-                    char_w = span.get('size', 11) * 0.6
-                    line_w += len(span.get('text', '')) * char_w
-                max_line_width = max(max_line_width, line_w)
-            # Use the wider of: original bbox width or estimated text width (+ padding)
-            width_pt = max(raw_w + 5, max_line_width + 10)
+            block_lines = block.get('lines', [])
+            is_para = _is_paragraph_block(block_lines)
+
+            if is_para:
+                # Paragraph block: use bbox width as constraint, let Word wrap
+                # (mirrors browser behavior: fixed-width container + word-wrap)
+                width_pt = raw_w + 2
+            else:
+                # Single line / label: estimate width from text content
+                max_line_width = 0
+                for line in block_lines:
+                    line_w = 0
+                    for span in line.get('spans', []):
+                        text = span.get('text', '')
+                        char_w = span.get('size', 11) * _char_width_multiplier(text)
+                        line_w += len(text) * char_w
+                    max_line_width = max(max_line_width, line_w)
+                width_pt = max(raw_w + 5, max_line_width + 10)
+
             vml_run = make_vml_textbox_run(
-                block['lines'],
+                block_lines,
                 left_pt=bbox[0], top_pt=bbox[1],
                 width_pt=width_pt,
-                height_pt=raw_h * 1.2
+                height_pt=raw_h * 1.2,
+                flow_as_paragraph=is_para,
             )
             anchor_p._element.append(vml_run)
 

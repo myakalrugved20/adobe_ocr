@@ -154,7 +154,7 @@ const TextBlock = forwardRef<TextBlockHandle, TextBlockProps>(function TextBlock
       let size = defaults.size;
       if (fontSizeStr) {
         const px = parseFloat(fontSizeStr);
-        if (px > 0) size = Math.round(px / 0.75 * 100) / 100; // px to pt (reverse of scale * 0.75)
+        if (px > 0) size = Math.round(px / scale / 0.75 * 100) / 100; // px to pt (reverse of span.size * scale * 0.75)
       }
 
       return {
@@ -205,7 +205,7 @@ const TextBlock = forwardRef<TextBlockHandle, TextBlockProps>(function TextBlock
     }
 
     return lines.length > 0 ? lines : null;
-  }, [block]);
+  }, [block, scale]);
 
   // Exit edit mode, save text, and resize bbox to fit content
   const exitEdit = useCallback(() => {
@@ -218,17 +218,9 @@ const TextBlock = forwardRef<TextBlockHandle, TextBlockProps>(function TextBlock
         const text = editRef.current.innerText || '';
         onTextChangeAll(text);
       }
-
-      // Update bbox to match the rendered size of the edit area
-      const el = nodeRef.current;
-      if (el) {
-        const newWidthPt = el.offsetWidth / scale;
-        const newHeightPt = el.offsetHeight / scale;
-        onResize([x0, y0, x0 + newWidthPt, y0 + newHeightPt]);
-      }
     }
     setEditing(false);
-  }, [onTextChangeAll, onUpdateLines, parseEditableToLines, onResize, scale, x0, y0]);
+  }, [onTextChangeAll, onUpdateLines, parseEditableToLines]);
 
   // Delayed blur: don't exit if focus moved to a PropertiesPanel control
   const handleBlur = useCallback(() => {
@@ -266,6 +258,7 @@ const TextBlock = forwardRef<TextBlockHandle, TextBlockProps>(function TextBlock
 
   // Get all text for contentEditable initial value
   const allText = block.lines.map(l => l.spans.map(s => s.text).join('')).join('\n');
+
   // Get dominant style for display in edit mode
   const firstSpan = block.lines[0]?.spans[0];
   const editFontSize = firstSpan ? Math.max(firstSpan.size * scale * 0.75, 6) : 10;
@@ -306,6 +299,7 @@ const TextBlock = forwardRef<TextBlockHandle, TextBlockProps>(function TextBlock
           zIndex: selected ? 100 : 10,
           boxSizing: 'border-box',
           padding: 0,
+          overflow: 'visible',
           opacity,
         }}
       >

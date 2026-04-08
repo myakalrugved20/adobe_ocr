@@ -199,11 +199,57 @@ def _render_pages(pdf_path, assets_dir):
     return page_info
 
 
-def _extract_text_formatting(pdf_path):
-    """Extract text per-line — each PDF line becomes its own movable block.
+def _dominant_font_size(spans):
+    """Return the most common font size across spans (by total text length)."""
+    size_len = {}
+    for s in spans:
+        size_len[s['size']] = size_len.get(s['size'], 0) + len(s['text'])
+    return max(size_len, key=size_len.get) if size_len else 0
 
-    Keeps inline spans together (e.g. "...offers **Expertise and Flexibility** -...")
-    while still giving per-line control (each risk-o-meter label is a separate line).
+
+def _should_merge_lines(prev_line, curr_line, prev_spans, curr_spans):
+    """Decide if two consecutive lines within a PyMuPDF block should be merged
+    into one paragraph block.
+
+    Merge when:
+      - Dominant font size matches (within 0.5pt tolerance)
+      - Vertical gap between lines is ≤ 1.5× the font size (normal line spacing)
+      - Both lines have reasonable width (not short labels)
+    Keep separate for short isolated labels (riskometer text, headings, etc.).
+    """
+    prev_size = _dominant_font_size(prev_spans)
+    curr_size = _dominant_font_size(curr_spans)
+
+    # Font sizes must be close
+    if abs(prev_size - curr_size) > 0.5:
+        return False
+
+    # Vertical gap: distance from bottom of previous line to top of current
+    gap = curr_line['bbox'][1] - prev_line['bbox'][3]
+    font_size = max(prev_size, curr_size, 1)
+
+    # Normal line spacing is roughly 1.0-1.5× the font size
+    # Allow up to 1.5× font size gap for paragraph continuations
+    if gap > font_size * 1.5 or gap < -font_size * 0.5:
+        return False
+
+    # Both lines should have some minimum width to be considered paragraph text
+    # Short labels (< 40pt wide) stay as individual blocks
+    MIN_WIDTH = 40
+    prev_width = prev_line['bbox'][2] - prev_line['bbox'][0]
+    curr_width = curr_line['bbox'][2] - curr_line['bbox'][0]
+    if prev_width < MIN_WIDTH and curr_width < MIN_WIDTH:
+        return False
+
+    return True
+
+
+def _extract_text_formatting(pdf_path):
+    """Extract text with smart grouping — paragraphs stay together, labels stay separate.
+
+    Lines within a PyMuPDF block that share font size and normal line spacing
+    are merged into a single paragraph block. Short labels, headings, and
+    lines with different formatting remain as individual blocks.
     """
     doc = fitz.open(pdf_path)
     pages_text = []
@@ -216,6 +262,9 @@ def _extract_text_formatting(pdf_path):
         for block in text_dict['blocks']:
             if block['type'] != 0:
                 continue
+
+            # First pass: build processed lines with their spans
+            processed_lines = []
             for line in block['lines']:
                 spans = []
                 for span in line['spans']:
@@ -240,14 +289,44 @@ def _extract_text_formatting(pdf_path):
                         'bbox': [round(v, 2) for v in span['bbox']],
                     })
                 if spans:
-                    # Each line becomes its own block (one line, multiple spans)
-                    blocks.append({
-                        'bbox': [round(v, 2) for v in line['bbox']],
-                        'lines': [{
-                            'spans': spans,
-                            'bbox': [round(v, 2) for v in line['bbox']],
-                        }],
+                    processed_lines.append({
+                        'spans': spans,
+                        'raw_line': line,
                     })
+
+            if not processed_lines:
+                continue
+
+            # Second pass: group consecutive lines into paragraph blocks
+            groups = [[processed_lines[0]]]
+            for i in range(1, len(processed_lines)):
+                prev = groups[-1][-1]
+                curr = processed_lines[i]
+                if _should_merge_lines(prev['raw_line'], curr['raw_line'],
+                                       prev['spans'], curr['spans']):
+                    groups[-1].append(curr)
+                else:
+                    groups.append([curr])
+
+            # Emit one block per group
+            for group in groups:
+                lines_out = []
+                bbox_x0 = min(pl['raw_line']['bbox'][0] for pl in group)
+                bbox_y0 = min(pl['raw_line']['bbox'][1] for pl in group)
+                bbox_x1 = max(pl['raw_line']['bbox'][2] for pl in group)
+                bbox_y1 = max(pl['raw_line']['bbox'][3] for pl in group)
+
+                for pl in group:
+                    lines_out.append({
+                        'spans': pl['spans'],
+                        'bbox': [round(v, 2) for v in pl['raw_line']['bbox']],
+                    })
+
+                blocks.append({
+                    'bbox': [round(bbox_x0, 2), round(bbox_y0, 2),
+                             round(bbox_x1, 2), round(bbox_y1, 2)],
+                    'lines': lines_out,
+                })
 
         pages_text.append(blocks)
 

@@ -4,13 +4,21 @@
 A web-based PDF-to-Word converter with a dual-pane editor and Google Translate integration. Upload a PDF, view it side-by-side with an editable Word representation, drag/edit text blocks, translate, and download the final .docx.
 
 ## Tech Stack
-- **Backend**: FastAPI, Adobe PDF Extract API (OCR + figure extraction), PyMuPDF (page rendering), python-docx + lxml (Word assembly), deep-translator (Google Translate)
+- **Backend**: FastAPI, Adobe PDF Extract API (OCR + figure extraction), PyMuPDF (page rendering), python-docx + lxml (Word assembly), Google Cloud Translation API v3 (GCP)
 - **Frontend**: React + TypeScript + Vite, react-pdf (PDF.js), react-draggable
 
 ## Extraction Pipeline
 1. **Adobe PDF Extract API** → structuredData.json with element positions + extracted figure PNGs (logos, icons, QR codes, photos, risk-o-meters)
 2. **PyMuPDF** → text-stripped page renders (backgrounds) + per-span text formatting (font, size, color, bold/italic)
-3. **Compose** → text-stripped background + Adobe figures at exact positions + text as VML textboxes
+3. **Smart paragraph grouping** → consecutive lines with same font size and normal line spacing are merged into paragraph blocks; short labels/headings stay as individual line blocks
+4. **Compose** → text-stripped background + Adobe figures at exact positions + text as VML textboxes
+
+## Translation
+- **Google Cloud Translation API v3** via service account credentials (`project-e3488f99-*.json`)
+- Batch translation (up to 512 texts per API call) with retry logic
+- 110+ languages supported (Indian, European, East Asian, Southeast Asian, Middle Eastern, African)
+- Script-aware width estimation for .docx output (Latin vs Devanagari/CJK character widths)
+- Paragraph blocks flow as single `<w:p>` in VML textboxes for natural word wrapping
 
 ## Coordinate System
 - Adobe uses bottom-left origin: convert with `y_tl = page_height - y_bl`
@@ -49,5 +57,5 @@ cd frontend && npm run dev
 Open http://localhost:5173
 
 ## Dependencies
-Backend: `fastapi uvicorn[standard] python-multipart pdfservices-sdk PyMuPDF Pillow python-docx lxml deep-translator`
+Backend: `fastapi uvicorn[standard] python-multipart pdfservices-sdk PyMuPDF Pillow python-docx lxml google-cloud-translate`
 Frontend: `react react-pdf react-draggable axios typescript vite`

@@ -1,6 +1,6 @@
 """
 Translation service.
-Translates text strings using Google Translate via deep-translator.
+Translates text strings using Google Cloud Translation API v3.
 """
 
 import os
@@ -8,39 +8,76 @@ import re
 import json
 import time
 import copy
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from deep_translator import GoogleTranslator
+
+from google.cloud import translate_v3 as translate
+from google.oauth2 import service_account
+
+from backend.config import BASE_DIR
+
+# ── GCP TRANSLATE CLIENT ────────────────────────────────────────────────
+
+_client = None
+_project_id = None
 
 
-def _translate_one(text, src, dest, index):
-    """Translate a single text string with retries. Returns (index, result)."""
-    translator = GoogleTranslator(source=src, target=dest)
-    for attempt in range(3):
-        try:
-            translated = translator.translate(text)
-            return (index, translated if translated else text)
-        except Exception as e:
-            if attempt < 2:
-                time.sleep(1 * (attempt + 1))
-            else:
-                print(f"    [!] Failed: '{text[:40]}': {e}")
-                return (index, text)
+def _get_client():
+    """Lazily initialise the GCP Translation client and project ID."""
+    global _client, _project_id
+    if _client is not None:
+        return _client, _project_id
+
+    creds_path = os.environ.get(
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        os.path.join(BASE_DIR, "project-e3488f99-018c-4f8e-b7b-825b30068c6b.json"),
+    )
+    credentials = service_account.Credentials.from_service_account_file(creds_path)
+    _project_id = credentials.project_id
+    _client = translate.TranslationServiceClient(credentials=credentials)
+    return _client, _project_id
+
+
+# ── BATCH TRANSLATION ───────────────────────────────────────────────────
+
+# GCP Translate v3 limits: 1024 texts or 30k codepoints per request
+_BATCH_SIZE = 512
+_BATCH_CODEPOINTS = 25_000
+
+
+def _make_batches(items):
+    """Split (index, text) pairs into batches respecting GCP limits."""
+    batches = []
+    batch = []
+    cp_count = 0
+    for idx, text in items:
+        text_cp = len(text)
+        if batch and (len(batch) >= _BATCH_SIZE or cp_count + text_cp > _BATCH_CODEPOINTS):
+            batches.append(batch)
+            batch = []
+            cp_count = 0
+        batch.append((idx, text))
+        cp_count += text_cp
+    if batch:
+        batches.append(batch)
+    return batches
 
 
 def translate_texts(texts, src='auto', dest='hi', max_workers=10,
                     on_progress=None):
-    """Translate a list of text strings using parallel workers.
+    """Translate a list of text strings using Google Cloud Translation API v3.
 
     Args:
         texts: list of strings to translate
-        src: source language code
+        src: source language code ('auto' for auto-detect)
         dest: target language code
-        max_workers: number of parallel translation threads
+        max_workers: unused (kept for API compatibility)
         on_progress: optional callback(done, total) for progress updates
 
     Returns:
         list of translated strings (same length as input)
     """
+    client, project_id = _get_client()
+    parent = f"projects/{project_id}/locations/global"
+
     total = len(texts)
     results = [None] * total
 
@@ -55,20 +92,44 @@ def translate_texts(texts, src='auto', dest='hi', max_workers=10,
             continue
         to_translate.append((i, text))
 
-    print(f"    Skipped {total - len(to_translate)}, translating {len(to_translate)} items with {max_workers} workers...")
+    print(f"    Skipped {total - len(to_translate)}, translating {len(to_translate)} items via GCP Translate v3...")
 
+    source_lang = None if src == 'auto' else src
+    batches = _make_batches(to_translate)
     done_count = 0
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(_translate_one, text, src, dest, idx): idx
-            for idx, text in to_translate
-        }
-        for future in as_completed(futures):
-            idx, translated = future.result()
-            results[idx] = translated
-            done_count += 1
-            if on_progress and done_count % 50 == 0:
-                on_progress(done_count, len(to_translate))
+
+    for batch in batches:
+        batch_texts = [text for _, text in batch]
+        batch_indices = [idx for idx, _ in batch]
+
+        for attempt in range(3):
+            try:
+                response = client.translate_text(
+                    request={
+                        "parent": parent,
+                        "contents": batch_texts,
+                        "target_language_code": dest,
+                        **({"source_language_code": source_lang} if source_lang else {}),
+                        "mime_type": "text/plain",
+                    }
+                )
+                for bi, translation in enumerate(response.translations):
+                    results[batch_indices[bi]] = translation.translated_text
+                done_count += len(batch)
+                if on_progress:
+                    on_progress(done_count, len(to_translate))
+                break
+            except Exception as e:
+                if attempt < 2:
+                    print(f"    [!] Batch retry {attempt + 1}: {e}")
+                    time.sleep(2 * (attempt + 1))
+                else:
+                    print(f"    [!] Batch failed after 3 attempts: {e}")
+                    # Fall back to originals for this batch
+                    for bi, idx in enumerate(batch_indices):
+                        if results[idx] is None:
+                            results[idx] = batch_texts[bi]
+                    done_count += len(batch)
 
     if on_progress:
         on_progress(len(to_translate), len(to_translate))
