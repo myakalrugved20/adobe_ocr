@@ -544,6 +544,7 @@ def translate_block_group(project_data, page_idx, block_ids, src_lang='auto',
     fmt = {
         'font': 'Arial', 'size': 11, 'color': '000000',
         'bold': False, 'italic': False,
+        'underline': False, 'subscript': False, 'superscript': False,
     }
     for block in target_blocks:
         for line in block['lines']:
@@ -555,6 +556,9 @@ def translate_block_group(project_data, page_idx, block_ids, src_lang='auto',
                         'color': span.get('color', '000000'),
                         'bold': span.get('bold', False),
                         'italic': span.get('italic', False),
+                        'underline': span.get('underline', False),
+                        'subscript': span.get('subscript', False),
+                        'superscript': span.get('superscript', False),
                     }
                     break
             else:

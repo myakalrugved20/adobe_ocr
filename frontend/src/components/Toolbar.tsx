@@ -120,6 +120,8 @@ const LANGUAGES = [
   { code: 'ps', name: 'Pashto' },
 ];
 
+const FEEDBACK_FORM_URL = 'https://docs.google.com/forms/d/e/1FAIpQLSdVWcslL-oOL7laq9mMgYFid5f1DIdQaTnbA5LW0MSycW8TfA/viewform?usp=header';
+
 interface ToolbarProps {
   onUpload: (file: File) => void;
   onTranslate: (lang: string) => void;
@@ -292,6 +294,25 @@ export default function Toolbar({
           </button>
         </>
       )}
+
+      <button
+        onClick={() => {
+          if (FEEDBACK_FORM_URL) {
+            window.open(FEEDBACK_FORM_URL, '_blank', 'noopener,noreferrer');
+          }
+        }}
+        disabled={!FEEDBACK_FORM_URL}
+        title={FEEDBACK_FORM_URL ? 'Share feedback' : 'Feedback URL not configured'}
+        style={{
+          ...btnStyle,
+          background: '#f9e2af',
+          color: '#1e1e2e',
+          opacity: FEEDBACK_FORM_URL ? 1 : 0.5,
+          cursor: FEEDBACK_FORM_URL ? 'pointer' : 'not-allowed',
+        }}
+      >
+        Feedback
+      </button>
     </div>
   );
 }
