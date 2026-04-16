@@ -6,6 +6,8 @@ export interface Span {
   bold: boolean;
   italic: boolean;
   underline?: boolean;
+  subscript?: boolean;
+  superscript?: boolean;
   bbox: number[];
 }
 

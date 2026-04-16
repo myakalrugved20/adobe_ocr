@@ -29,6 +29,9 @@ class SpanData(BaseModel):
     color: str
     bold: bool
     italic: bool
+    underline: bool = False
+    subscript: bool = False
+    superscript: bool = False
     bbox: list[float]
 
 

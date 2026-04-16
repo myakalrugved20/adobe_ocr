@@ -31,28 +31,95 @@ const TextBlock = forwardRef<TextBlockHandle, TextBlockProps>(function TextBlock
   const nodeRef = useRef<HTMLDivElement>(null!);
   const editRef = useRef<HTMLDivElement>(null);
   const startRef = useRef({ x: 0, y: 0, bbox: [0, 0, 0, 0] });
+  const lastRangeRef = useRef<Range | null>(null);
+  const fsWrapperRef = useRef<HTMLElement | null>(null);
+
+  // Track last known selection inside the editable, so PropertiesPanel inputs
+  // that steal focus can still have their formatting applied correctly.
+  useEffect(() => {
+    if (!editing) { fsWrapperRef.current = null; return; }
+    const save = () => {
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0 || !editRef.current) return;
+      const range = sel.getRangeAt(0);
+      if (editRef.current.contains(range.commonAncestorContainer)) {
+        lastRangeRef.current = range.cloneRange();
+      }
+    };
+    document.addEventListener('selectionchange', save);
+    return () => document.removeEventListener('selectionchange', save);
+  }, [editing]);
+
+  // Clear the fontSize wrapper when the user explicitly starts a new
+  // interaction inside the editable (click or key). This keeps the wrapper
+  // alive across slider ticks (which fire via focus-stealing inputs) but
+  // abandons it when the user re-selects / moves the caret themselves.
+  useEffect(() => {
+    if (!editing) return;
+    const el = editRef.current;
+    if (!el) return;
+    const clear = () => { fsWrapperRef.current = null; };
+    el.addEventListener('mousedown', clear);
+    el.addEventListener('keydown', clear);
+    return () => {
+      el.removeEventListener('mousedown', clear);
+      el.removeEventListener('keydown', clear);
+    };
+  }, [editing]);
 
   useImperativeHandle(ref, () => ({
     isEditing: () => editing,
     applyFormat: (command: string, value?: string) => {
       if (!editing || !editRef.current) return;
-      editRef.current.focus();
 
+      // fontSize uses direct DOM wrapping against the saved range — this avoids
+      // stealing focus from the slider/stepper, which would abort a drag.
       if (command === 'fontSize' && value) {
-        // execCommand fontSize only supports 1-7, so use a workaround:
-        // Apply size 7 as a marker, then replace with the real CSS size
-        document.execCommand('fontSize', false, '7');
-        editRef.current.querySelectorAll('font[size="7"]').forEach(el => {
-          const span = document.createElement('span');
-          span.style.fontSize = value + 'px';
-          span.innerHTML = el.innerHTML;
-          el.replaceWith(span);
-        });
-      } else {
-        document.execCommand(command, false, value);
+        const pt = parseFloat(value);
+        if (!(pt > 0)) return;
+        const px = Math.max(pt * scale * 0.75, 6);
+
+        // If we already have a live wrapper from this size-change session,
+        // just mutate its font-size. The wrapper is only abandoned when the
+        // user changes selection (see selectionchange listener).
+        const existing = fsWrapperRef.current;
+        if (existing && editRef.current.contains(existing)) {
+          existing.style.fontSize = px + 'px';
+          return;
+        }
+
+        // First tick: wrap the saved range in a new span.
+        const range = lastRangeRef.current;
+        if (!range || range.collapsed) return;
+        if (!editRef.current.contains(range.commonAncestorContainer)) return;
+
+        try {
+          const contents = range.extractContents();
+          contents.querySelectorAll('[style*="font-size"]').forEach(el => {
+            (el as HTMLElement).style.fontSize = '';
+          });
+          const wrapper = document.createElement('span');
+          wrapper.style.fontSize = px + 'px';
+          wrapper.appendChild(contents);
+          range.insertNode(wrapper);
+          fsWrapperRef.current = wrapper;
+        } catch { /* ignore */ }
+        return;
       }
+
+      // Other commands (bold/italic/underline/sub/super) use execCommand, which
+      // requires focus + a selection inside the editable.
+      const sel = window.getSelection();
+      const selInside = sel && sel.rangeCount > 0 &&
+        editRef.current.contains(sel.getRangeAt(0).commonAncestorContainer);
+      editRef.current.focus();
+      if (!selInside && lastRangeRef.current) {
+        sel?.removeAllRanges();
+        sel?.addRange(lastRangeRef.current);
+      }
+      document.execCommand(command, false, value);
     },
-  }), [editing]);
+  }), [editing, scale]);
 
   const [x0, y0, x1, _y1] = block.bbox;
   const left = x0 * scale;
@@ -138,6 +205,16 @@ const TextBlock = forwardRef<TextBlockHandle, TextBlockProps>(function TextBlock
       underline: firstSpan?.underline || false,
     };
 
+    const findSubSup = (el: HTMLElement | null): 'sub' | 'super' | null => {
+      let cur: HTMLElement | null = el;
+      while (cur && cur !== editRef.current) {
+        if (cur.tagName === 'SUB') return 'sub';
+        if (cur.tagName === 'SUP') return 'super';
+        cur = cur.parentElement;
+      }
+      return null;
+    };
+
     const getStyle = (el: HTMLElement) => {
       const computed = window.getComputedStyle(el);
       const colorRaw = computed.color;
@@ -157,6 +234,8 @@ const TextBlock = forwardRef<TextBlockHandle, TextBlockProps>(function TextBlock
         if (px > 0) size = Math.round(px / scale / 0.75 * 100) / 100; // px to pt (reverse of span.size * scale * 0.75)
       }
 
+      const subSup = findSubSup(el);
+
       return {
         font: computed.fontFamily?.split(',')[0]?.replace(/['"]/g, '').trim() || defaults.font,
         size,
@@ -164,45 +243,52 @@ const TextBlock = forwardRef<TextBlockHandle, TextBlockProps>(function TextBlock
         bold: computed.fontWeight === 'bold' || parseInt(computed.fontWeight) >= 700,
         italic: computed.fontStyle === 'italic',
         underline: computed.textDecorationLine?.includes('underline') || false,
+        subscript: subSup === 'sub',
+        superscript: subSup === 'super',
       };
     };
 
-    // Walk text nodes to build spans
     const lines: Block['lines'] = [];
-    const walker = document.createTreeWalker(editRef.current, NodeFilter.SHOW_TEXT);
     let currentLineSpans: Block['lines'][0]['spans'] = [];
 
-    let node: Node | null;
-    while ((node = walker.nextNode())) {
-      const text = node.textContent || '';
-      if (!text) continue;
-
-      const parent = node.parentElement;
-      if (!parent) continue;
-
-      const style = getStyle(parent);
-      const parts = text.split('\n');
-
-      parts.forEach((part, i) => {
-        if (i > 0) {
-          // Line break: flush current line
-          lines.push({ spans: currentLineSpans.length ? currentLineSpans : [{ text: '', bbox: [...block.bbox], ...defaults }], bbox: [...block.bbox] });
-          currentLineSpans = [];
-        }
-        if (part) {
-          currentLineSpans.push({
-            text: part,
-            bbox: [...block.bbox],
-            ...style,
-          });
-        }
+    const flushLine = () => {
+      lines.push({
+        spans: currentLineSpans.length ? currentLineSpans : [{ text: '', bbox: [...block.bbox], ...defaults }],
+        bbox: [...block.bbox],
       });
-    }
+      currentLineSpans = [];
+    };
 
-    // Flush last line
-    if (currentLineSpans.length > 0) {
-      lines.push({ spans: currentLineSpans, bbox: [...block.bbox] });
-    }
+    // Walk children: handle TEXT nodes, BR, and block wrappers (DIV/P the browser may insert)
+    const walk = (node: Node) => {
+      for (const child of Array.from(node.childNodes)) {
+        if (child.nodeType === Node.TEXT_NODE) {
+          const text = child.textContent || '';
+          if (!text) continue;
+          const parent = child.parentElement;
+          if (!parent) continue;
+          const style = getStyle(parent);
+          const parts = text.split('\n');
+          parts.forEach((part, i) => {
+            if (i > 0) flushLine();
+            if (part) currentLineSpans.push({ text: part, bbox: [...block.bbox], ...style });
+          });
+        } else if (child.nodeType === Node.ELEMENT_NODE) {
+          const el = child as HTMLElement;
+          if (el.tagName === 'BR') {
+            flushLine();
+          } else if (el.tagName === 'DIV' || el.tagName === 'P') {
+            if (currentLineSpans.length > 0) flushLine();
+            walk(el);
+            if (currentLineSpans.length > 0) flushLine();
+          } else {
+            walk(el);
+          }
+        }
+      }
+    };
+    walk(editRef.current);
+    if (currentLineSpans.length > 0) flushLine();
 
     return lines.length > 0 ? lines : null;
   }, [block, scale]);
@@ -256,10 +342,28 @@ const TextBlock = forwardRef<TextBlockHandle, TextBlockProps>(function TextBlock
     zIndex: 200,
   });
 
-  // Get all text for contentEditable initial value
-  const allText = block.lines.map(l => l.spans.map(s => s.text).join('')).join('\n');
+  // Build initial HTML preserving per-span styles so parseEditableToLines can recover them
+  const escapeHtml = (s: string) =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const initialHtml = block.lines.map(line =>
+    line.spans.map(span => {
+      const size = Math.max(span.size * scale * 0.75, 6);
+      const decls = [
+        `font-size:${size}px`,
+        `font-family:${span.font || 'Arial'}, Arial, sans-serif`,
+        `font-weight:${span.bold ? 'bold' : 'normal'}`,
+        `font-style:${span.italic ? 'italic' : 'normal'}`,
+        `color:#${span.color || '000000'}`,
+        span.underline ? 'text-decoration:underline' : '',
+      ].filter(Boolean).join(';');
+      let body = escapeHtml(span.text);
+      if (span.subscript) body = `<sub>${body}</sub>`;
+      else if (span.superscript) body = `<sup>${body}</sup>`;
+      return `<span style="${decls}">${body}</span>`;
+    }).join('') || '<br>'
+  ).join('<br>');
 
-  // Get dominant style for display in edit mode
+  // Fallback defaults for the editor container (used for newly-typed text)
   const firstSpan = block.lines[0]?.spans[0];
   const editFontSize = firstSpan ? Math.max(firstSpan.size * scale * 0.75, 6) : 10;
   const editFont = firstSpan?.font || 'Arial';
@@ -332,10 +436,24 @@ const TextBlock = forwardRef<TextBlockHandle, TextBlockProps>(function TextBlock
           </>
         )}
 
+        {/* Neutralize UA sub/sup font-size so edit→exit round-trip doesn't shrink text
+            (Word's <w:vertAlign> handles the actual size reduction in the .docx). */}
+        <style>{`
+          .tb-edit sub, .tb-edit sup, .tb-view sub, .tb-view sup {
+            font-size: inherit;
+            line-height: 0;
+            position: relative;
+            vertical-align: baseline;
+          }
+          .tb-edit sub, .tb-view sub { top: 0.3em; }
+          .tb-edit sup, .tb-view sup { top: -0.4em; }
+        `}</style>
+
         {/* Text content */}
         {editing ? (
           <div
             ref={editRef}
+            className="tb-edit"
             contentEditable
             suppressContentEditableWarning
             onBlur={handleBlur}
@@ -352,7 +470,7 @@ const TextBlock = forwardRef<TextBlockHandle, TextBlockProps>(function TextBlock
               fontWeight: editBold ? 'bold' : 'normal',
               fontStyle: editItalic ? 'italic' : 'normal',
               color: editColor,
-              background: 'rgba(255,255,255,0.95)',
+              background: 'transparent',
               border: '1px solid #89b4fa',
               borderRadius: 2,
               outline: 'none',
@@ -363,11 +481,11 @@ const TextBlock = forwardRef<TextBlockHandle, TextBlockProps>(function TextBlock
               lineHeight: 1.2,
               textAlign: block.align || 'left',
             }}
-            dangerouslySetInnerHTML={{ __html: allText.replace(/\n/g, '<br>') }}
+            dangerouslySetInnerHTML={{ __html: initialHtml }}
           />
         ) : (
           block.lines.map((line, li) => (
-            <div key={li} style={{
+            <div key={li} className="tb-view" style={{
               display: 'flex', flexWrap: 'wrap',
               justifyContent: block.align === 'center' ? 'center'
                 : block.align === 'right' ? 'flex-end'
@@ -378,6 +496,9 @@ const TextBlock = forwardRef<TextBlockHandle, TextBlockProps>(function TextBlock
             }}>
               {line.spans.map((span, si) => {
                 const fontSize = Math.max(span.size * scale * 0.75, 6);
+                const content = span.subscript ? <sub>{span.text}</sub>
+                  : span.superscript ? <sup>{span.text}</sup>
+                  : span.text;
                 return (
                   <span
                     key={si}
@@ -394,7 +515,7 @@ const TextBlock = forwardRef<TextBlockHandle, TextBlockProps>(function TextBlock
                       wordBreak: 'break-word',
                     }}
                   >
-                    {span.text}
+                    {content}
                   </span>
                 );
               })}

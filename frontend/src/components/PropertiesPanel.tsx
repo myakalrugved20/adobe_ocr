@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { Block } from '../types/project';
 
 interface PropertiesPanelProps {
@@ -15,7 +15,7 @@ function getDominant(block: Block) {
   const fonts: Record<string, number> = {};
   const sizes: Record<string, number> = {};
   const colors: Record<string, number> = {};
-  let boldCount = 0, italicCount = 0, underlineCount = 0, total = 0;
+  let boldCount = 0, italicCount = 0, underlineCount = 0, subCount = 0, superCount = 0, total = 0;
 
   for (const line of block.lines) {
     for (const span of line.spans) {
@@ -26,6 +26,8 @@ function getDominant(block: Block) {
       if (span.bold) boldCount++;
       if (span.italic) italicCount++;
       if (span.underline) underlineCount++;
+      if (span.subscript) subCount++;
+      if (span.superscript) superCount++;
     }
   }
 
@@ -39,6 +41,8 @@ function getDominant(block: Block) {
     bold: boldCount > total / 2,
     italic: italicCount > total / 2,
     underline: underlineCount > total / 2,
+    subscript: subCount > total / 2,
+    superscript: superCount > total / 2,
   };
 }
 
@@ -77,6 +81,12 @@ export default function PropertiesPanel({
   const text = useMemo(() => getAllText(block), [block]);
   const opacity = block.opacity ?? 1;
 
+  // Local UI state for the size slider/stepper. During selection-based editing
+  // we mutate the contentEditable DOM directly, without updating block state,
+  // so this decouples the control's displayed value from dom.size.
+  const [uiSize, setUiSize] = useState(dom.size);
+  useEffect(() => { setUiSize(dom.size); }, [dom.size, block.id]);
+
   return (
     <div style={{
       width: 220, flexShrink: 0,
@@ -113,10 +123,11 @@ export default function PropertiesPanel({
         <div style={labelStyle}>Font Size</div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <input
-            type="range" min={4} max={72} step={0.5}
-            value={dom.size}
+            type="range" min={4} max={200} step={0.5}
+            value={uiSize}
             onChange={e => {
               const v = Number(e.target.value);
+              setUiSize(v);
               if (!onApplySelectionFormat?.('fontSize', String(v))) {
                 onChangeProperty('size', v);
               }
@@ -124,11 +135,12 @@ export default function PropertiesPanel({
             style={{ flex: 1, accentColor: '#89b4fa' }}
           />
           <input
-            type="number" min={1} max={200} step={0.5}
-            value={Math.round(dom.size)}
+            type="number" min={1} max={400} step={1}
+            value={Number.isInteger(uiSize) ? uiSize : Number(uiSize.toFixed(1))}
             onChange={e => {
               const v = Number(e.target.value);
               if (v <= 0) return;
+              setUiSize(v);
               if (!onApplySelectionFormat?.('fontSize', String(v))) {
                 onChangeProperty('size', v);
               }
@@ -141,7 +153,7 @@ export default function PropertiesPanel({
               boxSizing: 'border-box',
             }}
           />
-          <span style={{ fontSize: 10, color: '#6c7086', fontWeight: 600 }}>PX</span>
+          <span style={{ fontSize: 10, color: '#6c7086', fontWeight: 600 }}>PT</span>
         </div>
       </div>
 
@@ -228,6 +240,30 @@ export default function PropertiesPanel({
               color: dom.underline ? '#1e1e2e' : '#cdd6f4',
             }}
           >U</button>
+          <button
+            onMouseDown={e => e.preventDefault()}
+            onClick={() => {
+              if (!onApplySelectionFormat?.('subscript')) onChangeProperty('subscript', !dom.subscript);
+            }}
+            title="Subscript"
+            style={{
+              ...btnBase,
+              background: dom.subscript ? '#89b4fa' : '#1e1e2e',
+              color: dom.subscript ? '#1e1e2e' : '#cdd6f4',
+            }}
+          >X<sub style={{ fontSize: 9 }}>2</sub></button>
+          <button
+            onMouseDown={e => e.preventDefault()}
+            onClick={() => {
+              if (!onApplySelectionFormat?.('superscript')) onChangeProperty('superscript', !dom.superscript);
+            }}
+            title="Superscript"
+            style={{
+              ...btnBase,
+              background: dom.superscript ? '#89b4fa' : '#1e1e2e',
+              color: dom.superscript ? '#1e1e2e' : '#cdd6f4',
+            }}
+          >X<sup style={{ fontSize: 9 }}>2</sup></button>
         </div>
       </div>
 

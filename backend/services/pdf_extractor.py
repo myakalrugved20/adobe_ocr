@@ -279,13 +279,15 @@ def _extract_text_formatting(pdf_path):
                         or 'medium' in fn
                     )
                     is_italic = bool(flags & (1 << 1))
+                    is_superscript = bool(flags & (1 << 0))
                     spans.append({
-                        'text': _normalize_text(span['text']),
+                        'text': _normalize_text(span['text'], span['font']),
                         'font': map_font(span['font']),
                         'size': round(span['size'], 2),
                         'color': color_hex(span['color']),
                         'bold': is_bold,
                         'italic': is_italic,
+                        'superscript': is_superscript,
                         'bbox': [round(v, 2) for v in span['bbox']],
                     })
                 if spans:

@@ -150,6 +150,11 @@ def _build_run_element(span, parent):
     color_el = etree.SubElement(rPr, qn('w:color'))
     color_el.set(qn('w:val'), _safe(span.get('color', '000000')))
 
+    if span.get('superscript'):
+        etree.SubElement(rPr, qn('w:vertAlign')).set(qn('w:val'), 'superscript')
+    elif span.get('subscript'):
+        etree.SubElement(rPr, qn('w:vertAlign')).set(qn('w:val'), 'subscript')
+
     t_el = etree.SubElement(r_el, qn('w:t'))
     t_el.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
     t_el.text = _safe(span.get('text', ''))
