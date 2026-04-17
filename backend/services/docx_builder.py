@@ -161,6 +161,31 @@ def _build_run_element(span, parent):
     return r_el
 
 
+def _line_height_twips(lines):
+    """Exact line height in twentieths-of-a-point, derived from PyMuPDF line bboxes.
+
+    Word's default 'auto' line spacing (font * ~1.15) is looser than what PDFs
+    typically use, so multi-line blocks overflow their bbox. Using the actual
+    baseline-to-baseline distance keeps Word's render flush with the source.
+    """
+    if len(lines) >= 2:
+        deltas = []
+        for i in range(1, len(lines)):
+            prev_y = (lines[i - 1].get('bbox') or [None, None])[1]
+            cur_y = (lines[i].get('bbox') or [None, None])[1]
+            if prev_y is not None and cur_y is not None and cur_y > prev_y:
+                deltas.append(cur_y - prev_y)
+        if deltas:
+            return max(120, int((sum(deltas) / len(deltas)) * 20))
+    if lines:
+        max_size = max(
+            (s.get('size', 11) for s in lines[0].get('spans', [])),
+            default=11,
+        )
+        return max(120, int(max_size * 1.15 * 20))
+    return 240
+
+
 def _is_paragraph_block(lines):
     """Check if a multi-line block should flow as a single paragraph.
 
@@ -201,6 +226,7 @@ def make_vml_textbox_run(lines, left_pt, top_pt, width_pt, height_pt,
     r_root = etree.Element(_vqn('w:r'), nsmap=NSMAP)
     pict = etree.SubElement(r_root, _vqn('w:pict'))
 
+    wrap_style = 'square' if flow_as_paragraph else 'none'
     style = (
         f'position:absolute;'
         f'left:{left_pt:.2f}pt;top:{top_pt:.2f}pt;'
@@ -208,16 +234,17 @@ def make_vml_textbox_run(lines, left_pt, top_pt, width_pt, height_pt,
         f'z-index:251660288;'
         f'mso-position-horizontal-relative:page;'
         f'mso-position-vertical-relative:page;'
-        f'mso-fit-shape-to-text:t'
+        f'mso-wrap-style:{wrap_style}'
     )
     shape = etree.SubElement(pict, _vqn('v:shape'), {
         'style': style, 'filled': 'f', 'stroked': 'f',
     })
     textbox = etree.SubElement(shape, _vqn('v:textbox'), {
         'inset': '0,0,0,0',
-        'style': 'mso-fit-shape-to-text:t',
     })
     txbx = etree.SubElement(textbox, _vqn('w:txbxContent'))
+
+    line_twips = str(_line_height_twips(lines))
 
     if flow_as_paragraph and len(lines) > 1:
         # Merge all lines into one <w:p> — Word wraps within textbox width
@@ -226,8 +253,8 @@ def make_vml_textbox_run(lines, left_pt, top_pt, width_pt, height_pt,
         spacing = etree.SubElement(pPr, _vqn('w:spacing'))
         spacing.set(_vqn('w:after'), '0')
         spacing.set(_vqn('w:before'), '0')
-        spacing.set(_vqn('w:line'), '240')
-        spacing.set(_vqn('w:lineRule'), 'auto')
+        spacing.set(_vqn('w:line'), line_twips)
+        spacing.set(_vqn('w:lineRule'), 'exact')
         for li, line in enumerate(lines):
             # Add a space run between lines so words don't merge
             if li > 0:
@@ -251,8 +278,8 @@ def make_vml_textbox_run(lines, left_pt, top_pt, width_pt, height_pt,
             spacing = etree.SubElement(pPr, _vqn('w:spacing'))
             spacing.set(_vqn('w:after'), '0')
             spacing.set(_vqn('w:before'), '0')
-            spacing.set(_vqn('w:line'), '240')
-            spacing.set(_vqn('w:lineRule'), 'auto')
+            spacing.set(_vqn('w:line'), line_twips)
+            spacing.set(_vqn('w:lineRule'), 'exact')
             for span in line.get('spans', []):
                 _build_run_element(span, p_el)
 
@@ -339,14 +366,13 @@ def add_positioned_table(anchor_p, table_data, page_height_pt):
     tbl_layout = etree.SubElement(tbl_pr, qn('w:tblLayout'))
     tbl_layout.set(qn('w:type'), 'fixed')
 
-    # Borders
+    # No borders — the page background PNG already contains the table grid.
     tbl_borders = etree.SubElement(tbl_pr, qn('w:tblBorders'))
     for border_name in ['top', 'left', 'bottom', 'right', 'insideH', 'insideV']:
         border_el = etree.SubElement(tbl_borders, qn(f'w:{border_name}'))
-        border_el.set(qn('w:val'), 'single')
-        border_el.set(qn('w:sz'), '4')
+        border_el.set(qn('w:val'), 'none')
+        border_el.set(qn('w:sz'), '0')
         border_el.set(qn('w:space'), '0')
-        border_el.set(qn('w:color'), '999999')
 
     # Table grid
     tbl_grid = etree.SubElement(tbl_el, qn('w:tblGrid'))
@@ -370,12 +396,20 @@ def add_positioned_table(anchor_p, table_data, page_height_pt):
     for ri, row in enumerate(rows):
         tr_el = etree.SubElement(tbl_el, qn('w:tr'))
 
-        # Set fixed row height from cell bboxes to prevent table growth
-        row_h_pt = 0
+        # Set fixed row height from cell bboxes. Use the rectangle every cell
+        # in the row shares (max top → min bottom) so a vertically-merged cell
+        # from the source doesn't inflate this row and shove later rows down.
+        cell_tops = []
+        cell_bots = []
         for cell in row['cells']:
             cb = cell.get('bbox', [])
             if cb and len(cb) >= 4 and cb[3] > cb[1]:
-                row_h_pt = max(row_h_pt, cb[3] - cb[1])
+                cell_tops.append(cb[1])
+                cell_bots.append(cb[3])
+        if cell_tops and cell_bots:
+            row_h_pt = max(0.0, min(cell_bots) - max(cell_tops))
+        else:
+            row_h_pt = 0
         if row_h_pt > 0:
             tr_pr = etree.SubElement(tr_el, qn('w:trPr'))
             tr_height = etree.SubElement(tr_pr, qn('w:trHeight'))
@@ -429,35 +463,36 @@ def add_positioned_table(anchor_p, table_data, page_height_pt):
                 mar.set(qn('w:w'), '0')
                 mar.set(qn('w:type'), 'dxa')
 
-            # Header shading
-            if cell.get('is_header'):
-                shading = etree.SubElement(tc_pr, qn('w:shd'))
-                shading.set(qn('w:val'), 'clear')
-                shading.set(qn('w:color'), 'auto')
-                shading.set(qn('w:fill'), 'E8E8E8')
+            # No shading — header backgrounds come from the page PNG.
 
             # Cell paragraph with text
             p_el = etree.SubElement(tc_el, qn('w:p'))
             p_pr = etree.SubElement(p_el, qn('w:pPr'))
             spacing = etree.SubElement(p_pr, qn('w:spacing'))
-            spacing.set(qn('w:before'), '10')
-            spacing.set(qn('w:after'), '10')
+            spacing.set(qn('w:before'), '0')
+            spacing.set(qn('w:after'), '0')
             spacing.set(qn('w:line'), '200')
             spacing.set(qn('w:lineRule'), 'atLeast')
 
             text = cell.get('text', '')
             if text:
+                # Cell font size scales to cell height (4–7 pt range), matching
+                # what the legacy VML cell overlay used.
+                cb_h = (cell_bbox[3] - cell_bbox[1]) if (cell_bbox and len(cell_bbox) >= 4) else 0
+                font_size_pt = min(7.0, max(4.0, cb_h * 0.7)) if cb_h > 0 else 6.0
+                sz_val = str(int(round(font_size_pt * 2)))
+
                 r_el = etree.SubElement(p_el, qn('w:r'))
                 r_pr = etree.SubElement(r_el, qn('w:rPr'))
                 sz = etree.SubElement(r_pr, qn('w:sz'))
-                sz.set(qn('w:val'), '12')  # 6pt
+                sz.set(qn('w:val'), sz_val)
                 sz_cs = etree.SubElement(r_pr, qn('w:szCs'))
-                sz_cs.set(qn('w:val'), '12')
+                sz_cs.set(qn('w:val'), sz_val)
                 r_fonts = etree.SubElement(r_pr, qn('w:rFonts'))
-                r_fonts.set(qn('w:ascii'), 'Arial')
-                r_fonts.set(qn('w:hAnsi'), 'Arial')
-                r_fonts.set(qn('w:cs'), 'Arial')
-                r_fonts.set(qn('w:eastAsia'), 'Arial')
+                r_fonts.set(qn('w:ascii'), 'Calibri')
+                r_fonts.set(qn('w:hAnsi'), 'Calibri')
+                r_fonts.set(qn('w:cs'), 'Calibri')
+                r_fonts.set(qn('w:eastAsia'), 'Calibri')
                 if cell.get('is_header'):
                     etree.SubElement(r_pr, qn('w:b'))
                 t_el = etree.SubElement(r_el, qn('w:t'))
@@ -525,9 +560,9 @@ def build_docx(project_data, project_dir, output_path):
                 behind=False
             )
 
-        # Render table cell text as VML textboxes (same as regular text).
-        # The background image already contains the table borders/headers,
-        # so we just need text at the exact cell positions.
+        # Render each table cell as its own VML textbox at the cell's exact
+        # bbox. The background PNG supplies the grid + header banners; this
+        # only places the cell text on top.
         page_tables = page.get('tables', [])
         table_bboxes = [t['bbox'] for t in page_tables]
         for table in page_tables:
@@ -537,24 +572,28 @@ def build_docx(project_data, project_dir, output_path):
                     if not text:
                         continue
                     cb = cell.get('bbox', [0, 0, 0, 0])
-                    if cb[2] <= cb[0]:
+                    if not (len(cb) >= 4 and cb[2] > cb[0] and cb[3] > cb[1]):
                         continue
                     cw = cb[2] - cb[0]
                     ch = cb[3] - cb[1]
-                    font_size = min(7, max(4, ch * 0.7))
                     is_header = cell.get('is_header', False)
-                    cell_lines = [{'spans': [{
-                        'text': text,
-                        'font': 'Arial',
-                        'size': round(font_size, 1),
-                        'color': '000000',
-                        'bold': is_header,
-                        'italic': False,
-                    }]}]
+                    font_size = round(min(7.0, max(4.0, ch * 0.7)), 1)
+                    cell_lines = [{
+                        'spans': [{
+                            'text': text,
+                            'font': 'Calibri',
+                            'size': font_size,
+                            'color': '000000',
+                            'bold': is_header,
+                            'italic': False,
+                        }],
+                        'bbox': cb,
+                    }]
                     vml_run = make_vml_textbox_run(
                         cell_lines,
                         left_pt=cb[0], top_pt=cb[1],
-                        width_pt=cw + 2, height_pt=ch,
+                        width_pt=cw, height_pt=ch,
+                        flow_as_paragraph=True,
                     )
                     anchor_p._element.append(vml_run)
 
@@ -589,7 +628,7 @@ def build_docx(project_data, project_dir, output_path):
                 block_lines,
                 left_pt=bbox[0], top_pt=bbox[1],
                 width_pt=width_pt,
-                height_pt=raw_h * 1.2,
+                height_pt=raw_h,
                 flow_as_paragraph=is_para,
             )
             anchor_p._element.append(vml_run)
