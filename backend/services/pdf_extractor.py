@@ -112,7 +112,45 @@ def map_font(font_name):
         return 'Times New Roman'
     if 'courier' in fn or 'mono' in fn:
         return 'Courier New'
-    return 'Arial'
+    # Modern sans-serifs map to Calibri (≈7% narrower than Arial, closer metrics
+    # to the originals; ships with Word/Office on every platform).
+    sans_keys = ('anek', 'inter', 'sourcesans', 'source sans', 'opensans',
+                 'open sans', 'lato', 'roboto', 'nunito', 'graphik')
+    if any(k in fn for k in sans_keys):
+        return 'Calibri'
+    return 'Calibri'
+
+
+# Width of common fallback fonts at the same point size, relative to Helvetica.
+# Used to convert Helvetica-measured widths into per-fallback width estimates.
+_FONT_METRIC_RATIO = {
+    'Arial':            1.00,
+    'Arial Black':      1.15,
+    'Arial Narrow':     0.83,
+    'Calibri':          0.93,
+    'Times New Roman':  0.93,
+    'Courier New':      1.00,
+}
+
+# Cached PyMuPDF Base14 fonts for measurement (always available, no install).
+_HELV_FONTS = {}
+
+
+def _helv(bold=False, italic=False):
+    key = (bool(bold), bool(italic))
+    if key not in _HELV_FONTS:
+        name = {(False, False): 'helv', (True, False): 'hebo',
+                (False, True): 'heit', (True, True): 'hebi'}[key]
+        _HELV_FONTS[key] = fitz.Font(name)
+    return _HELV_FONTS[key]
+
+
+def _measure_text_width(text, font_name, size, bold=False, italic=False):
+    """Rendered width in points for text at size pt in the chosen fallback font."""
+    if not text:
+        return 0.0
+    base_w = _helv(bold, italic).text_length(text, fontsize=size)
+    return base_w * _FONT_METRIC_RATIO.get(font_name, 1.0)
 
 
 # Known PUA-to-Unicode mappings for symbols in PDFs with custom/embedded fonts.
@@ -312,6 +350,28 @@ def _extract_text_formatting(pdf_path):
 
             # Emit one block per group
             for group in groups:
+                # Auto-shrink: if rendered width with the fallback font exceeds
+                # the PDF-measured line bbox, scale down all spans uniformly.
+                # Uniform across the block keeps multi-line headings consistent.
+                worst_ratio = 1.0
+                for pl in group:
+                    line_bbox = pl['raw_line']['bbox']
+                    line_w = line_bbox[2] - line_bbox[0]
+                    if line_w <= 0:
+                        continue
+                    rendered = sum(
+                        _measure_text_width(s['text'], s['font'], s['size'],
+                                            s.get('bold'), s.get('italic'))
+                        for s in pl['spans']
+                    )
+                    if rendered > line_w * 1.02:
+                        worst_ratio = min(worst_ratio, line_w / rendered)
+                if worst_ratio < 1.0:
+                    scale = max(0.85, worst_ratio)
+                    for pl in group:
+                        for s in pl['spans']:
+                            s['size'] = round(s['size'] * scale, 2)
+
                 lines_out = []
                 bbox_x0 = min(pl['raw_line']['bbox'][0] for pl in group)
                 bbox_y0 = min(pl['raw_line']['bbox'][1] for pl in group)
@@ -380,6 +440,9 @@ def _parse_adobe_tables(adobe_data, page_heights):
         # Key: (page, row_idx) -> {col_idx -> cell_data}
         page_rows_dict = {}
 
+        # Key cells by their parent TD/TH path so siblings (P, Span children)
+        # accumulate into the SAME cell, but distinct TD/TH siblings stay
+        # separate even when they lack an explicit [N] index in the path.
         for el in child_elements:
             path = el.get('Path', '')
             rel_path = path[len(table_path):]
@@ -392,48 +455,45 @@ def _parse_adobe_tables(adobe_data, page_heights):
                 continue
             row_idx = int(tr_match.group(1)) if tr_match.group(1) else 1
 
-            # Extract col index from TD/TH or TD[n]/TH[n]
-            cell_match = re.search(r'/T[DH](?:\[(\d+)\])?', rel_path)
+            # Capture the parent TD/TH (this is the unique cell key).
+            cell_match = re.match(
+                r'/TR(?:\[\d+\])?/(T[DH](?:\[\d+\])?)', rel_path
+            )
             if not cell_match:
                 continue
-            col_idx = int(cell_match.group(1)) if cell_match.group(1) else 1
+            cell_tag = cell_match.group(1)  # e.g. 'TH', 'TD', 'TD[2]'
+            is_header = cell_tag.startswith('TH')
 
             key = (el_page, row_idx)
-
-            text = _normalize_text(el.get('Text', '').strip())
-            if not text:
-                # Cell container (TD/TH) — has bbox but no text
-                cell_bbox_bl = el.get('attributes', {}).get('BBox', [])
-                if cell_bbox_bl and len(cell_bbox_bl) >= 4:
-                    if key not in page_rows_dict:
-                        page_rows_dict[key] = {}
-                    if col_idx not in page_rows_dict[key]:
-                        page_rows_dict[key][col_idx] = {
-                            'text': '',
-                            'bbox': [
-                                round(cell_bbox_bl[0], 2),
-                                round(page_h - cell_bbox_bl[3], 2),
-                                round(cell_bbox_bl[2], 2),
-                                round(page_h - cell_bbox_bl[1], 2),
-                            ],
-                            'is_header': '/TH' in rel_path,
-                        }
-                continue
-
             if key not in page_rows_dict:
                 page_rows_dict[key] = {}
-            if col_idx not in page_rows_dict[key]:
-                page_rows_dict[key][col_idx] = {
+            if cell_tag not in page_rows_dict[key]:
+                page_rows_dict[key][cell_tag] = {
                     'text': '',
                     'bbox': [0, 0, 0, 0],
-                    'is_header': '/TH' in rel_path,
+                    'is_header': is_header,
                 }
+            cell = page_rows_dict[key][cell_tag]
 
-            cell = page_rows_dict[key][col_idx]
-            if cell['text']:
-                cell['text'] += ' ' + text
-            else:
-                cell['text'] = text
+            # If this element IS the TD/TH container, record its bbox.
+            is_container = re.fullmatch(
+                r'/TR(?:\[\d+\])?/T[DH](?:\[\d+\])?', rel_path
+            ) is not None
+            cell_bbox_bl = el.get('attributes', {}).get('BBox', [])
+            if is_container and cell_bbox_bl and len(cell_bbox_bl) >= 4:
+                cell['bbox'] = [
+                    round(cell_bbox_bl[0], 2),
+                    round(page_h - cell_bbox_bl[3], 2),
+                    round(cell_bbox_bl[2], 2),
+                    round(page_h - cell_bbox_bl[1], 2),
+                ]
+
+            text = _normalize_text(el.get('Text', '').strip())
+            if text:
+                if cell['text']:
+                    cell['text'] += ' ' + text
+                else:
+                    cell['text'] = text
 
         # Group rows by page
         pages_in_table = sorted(set(pg for pg, _ in page_rows_dict.keys()))
@@ -450,17 +510,10 @@ def _parse_adobe_tables(adobe_data, page_heights):
             if not rows_dict:
                 continue
 
-            max_col = num_cols
-            for ri in rows_dict:
-                for ci in rows_dict[ri]:
-                    if ci > max_col:
-                        max_col = ci
-
-            # Cluster column edges
+            # Cluster column edges across every cell on this page
             raw_edges = []
-            for ri in sorted(rows_dict.keys()):
-                for ci in sorted(rows_dict[ri].keys()):
-                    cell = rows_dict[ri][ci]
+            for cells_dict in rows_dict.values():
+                for cell in cells_dict.values():
                     bbox = cell.get('bbox', [0, 0, 0, 0])
                     if bbox[2] > bbox[0]:
                         raw_edges.append(round(bbox[0], 1))
@@ -475,12 +528,16 @@ def _parse_adobe_tables(adobe_data, page_heights):
                 else:
                     col_edges.append(e)
 
-            # Build rows with col_span
+            # Build rows: cells in left-to-right order by bbox x0, with col_span
             rows = []
             for ri in sorted(rows_dict.keys()):
+                row_cells = sorted(
+                    rows_dict[ri].values(),
+                    key=lambda c: c.get('bbox', [0])[0],
+                )
                 cells = []
-                for ci in sorted(rows_dict[ri].keys()):
-                    cell = dict(rows_dict[ri][ci])
+                for cell in row_cells:
+                    cell = dict(cell)
                     bbox = cell.get('bbox', [0, 0, 0, 0])
                     if bbox[2] > bbox[0] and len(col_edges) > 1:
                         cell_left = round(bbox[0], 1)
@@ -495,6 +552,8 @@ def _parse_adobe_tables(adobe_data, page_heights):
                         cell['col_span'] = 1
                     cells.append(cell)
                 rows.append({'cells': cells})
+
+            max_col = max((len(r['cells']) for r in rows), default=num_cols)
 
             # Compute bbox from cells on this page only
             all_min_x = all_min_y = 99999
